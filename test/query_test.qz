@@ -232,6 +232,101 @@ class QueryTest < Test::Case
     admin.exec("DROP ROLE iter_user")
   end
 
+  def prepared_on_server(c: PG::Connection) -> Int
+    c.exec("SELECT count(*) FROM pg_prepared_statements").rows[0].int(0)
+  end
+
+  def test_statements_prepared_once_and_reused
+    c = conn
+    3.times { |i| assert_equal(i, c.query("SELECT $1::int", [i]).rows[0].int(0)) }
+    assert_equal(1, c.prepared_statements)
+    assert_equal(1, prepared_on_server(c))
+  end
+
+  def test_statement_cache_evicts
+    config = PG.parse_url(server.url)
+    c = PG.connect(host: config.host, port: config.port, user: config.user, password: config.password,
+                   database: "postgres", statement_cache_size: 2)
+    @opened = @opened.push(c)
+    ["SELECT 1", "SELECT 2", "SELECT 3", "SELECT 4"].each { |q| c.query(q) }
+    assert_equal(2, c.prepared_statements)
+    assert_equal(2, prepared_on_server(c))
+    c.query("SELECT 3")
+    c.query("SELECT 5")
+    assert_equal(2, prepared_on_server(c))
+  end
+
+  def test_statement_cache_off
+    c = PG.connect(server.url + (server.url.include?("?") ? "&" : "?") + "statement_cache_size=0")
+    @opened = @opened.push(c)
+    c.query("SELECT $1::int", [1])
+    assert_equal(0, c.prepared_statements)
+    assert_equal(0, prepared_on_server(c))
+  end
+
+  def test_changed_result_type_reprepares
+    c = conn
+    c.exec("CREATE TEMP TABLE w (a int)")
+    c.query("INSERT INTO w VALUES ($1)", [1])
+    assert_equal(1, c.query("SELECT * FROM w").rows[0].int(0))
+    c.exec("ALTER TABLE w ADD COLUMN b text")
+    # Outside a transaction: prepared again and retried.
+    assert_equal(["a", "b"], c.query("SELECT * FROM w").column_names)
+    c.exec("ALTER TABLE w ADD COLUMN c text")
+    e = assert_raise(PG::ServerError) do
+      c.transaction { |tx| tx.query("SELECT * FROM w") }
+    end.as(PG::ServerError)
+    assert_equal("0A000", e.code)
+    assert_equal(["a", "b", "c"], c.query("SELECT * FROM w").column_names)
+  end
+
+  def test_cache_stays_true_to_the_server
+    c = conn
+    # A notice handler's exception after the statement was prepared.
+    c.on_notice { |_| raise "handler" }
+    3.times { assert_raise(RuntimeError) { c.query("DO $$ BEGIN RAISE NOTICE 'hi'; END $$") } }
+    assert_equal(1, c.prepared_statements)
+    d = PG.connect(server.url + (server.url.include?("?") ? "&" : "?") + "statement_cache_size=1")
+    @opened = @opened.push(d)
+    d.query("SELECT 10")
+    assert_raise(ArgumentError) { d.query("SELECT 11\0") }
+    d.query("SELECT 12")
+    assert_equal(1, prepared_on_server(d))
+    # DISCARD ALL through query, and a statement gone from the server.
+    c.on_notice { |_| nil }
+    c.query("SELECT $1::int", [1])
+    c.query("DISCARD ALL")
+    assert_equal(0, c.prepared_statements)
+  end
+
+  def test_statement_gone_is_reprepared
+    c = conn
+    c.query("SELECT $1::int", [1])
+    # The first statement of a connection is qz1; dropping it behind the
+    # cache's back makes the next call fail with 26000, then retry.
+    c.exec("DEALLOCATE qz1")
+    assert_equal(1, c.prepared_statements)
+    assert_equal(2, c.query("SELECT $1::int", [2]).rows[0].int(0))
+    assert_equal(1, prepared_on_server(c))
+  end
+
+  def test_discard_all_clears_the_cache
+    c = conn
+    c.query("SELECT $1::int", [1])
+    c.exec("DISCARD ALL")
+    assert_equal(0, c.prepared_statements)
+    assert_equal(2, c.query("SELECT $1::int", [2]).rows[0].int(0))
+  end
+
+  def test_failed_parse_is_not_cached
+    c = conn
+    assert_raise(PG::ServerError) { c.query("SELEC 1") }
+    assert_equal(0, c.prepared_statements)
+    assert_raise(PG::ServerError) { c.query("SELECT 1/$1::int", [0]) }
+    assert_equal(1, c.prepared_statements)
+    assert_equal(1, c.query("SELECT 1/$1::int", [1]).rows[0].int(0))
+  end
+
   def test_md5_and_cleartext_roles
     omit_unless(server.ours?, "PG_TEST_URL's server: its pg_hba.conf is not ours")
     admin = conn

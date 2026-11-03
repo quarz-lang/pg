@@ -9,18 +9,28 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 # or address, or a directory holding the server's unix socket (a path
 # starting with `/`). A password is sent in clear only over a unix socket,
 # or when `allow_cleartext` says so. `max_scram_iterations` is the most
-# SCRAM iterations the server may ask for.
+# SCRAM iterations the server may ask for, `statement_cache_size` how many
+# prepared statements `PG::Connection#query` keeps.
 public def connect(*, host: String = "localhost", port: Int = 5432, user: String = Config.default_user,
                    password: String? = nil, database: String? = nil, application_name: String? = nil,
                    allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
-                   max_scram_iterations: Int = Scram::MAX_ITERATIONS) -> Connection
+                   max_scram_iterations: Int = Scram::MAX_ITERATIONS,
+                   statement_cache_size: Int = Connection::STATEMENT_CACHE_SIZE) -> Connection
+  if statement_cache_size < 0 || statement_cache_size > 999_999
+    raise ArgumentError.new("statement_cache_size: #{statement_cache_size}")
+  end
   Connection.open(Config.new(host:, port:, user:, password:, database:, application_name:,
-                             allow_cleartext:, connect_timeout:, max_scram_iterations:))
+                             allow_cleartext:, connect_timeout:, max_scram_iterations:,
+                             statement_cache_size:))
 end
 
 # A session with the server: one task's at a time.
 class Connection
+  # How many prepared statements `#query` keeps by default.
+  STATEMENT_CACHE_SIZE = 100
+
   @config: Config
+  @statements: StatementCache
   @io: IO
   @reader: MessageReader
   var @parameters: Hash[String, String] = {}
@@ -78,6 +88,7 @@ class Connection
   # A connection over `io`, not started: `PG.connect` makes them.
   def initialize(@config: Config, @io: IO)
     @reader = MessageReader.new(io)
+    @statements = StatementCache.new(@config.statement_cache_size)
   end
 
   # The run-time parameters the server reported (server_version,
@@ -134,6 +145,8 @@ class Connection
       in Backend::DataRow(values:)
         rows = rows.push(Row.new(columns, values))
       in Backend::CommandComplete(tag:)
+        # The server dropped every prepared statement.
+        @statements.clear if tag == "DISCARD ALL" || tag == "DEALLOCATE ALL"
         results = results.push(Result.new(columns, rows, tag))
         columns = []
         rows = []
@@ -150,31 +163,78 @@ class Connection
   # `$1`, `$2`, ...: each is sent apart from the SQL, so no value needs
   # quoting. A parameter may be nil (NULL), an Int, a Float, a String, a
   # Bool, Bytes (bytea), a Time (sent in UTC) or a Symbol (its name);
-  # another raises `ArgumentError`. Raises `PG::ServerError` when the statement
-  # fails. A call cut short closes the connection, as `#exec` says.
-  def query(sql: String, params: Array[Object?] = []) -> Result
+  # another raises `ArgumentError`. Raises `PG::ServerError` when the
+  # statement fails. A call cut short closes the connection, as `#exec`
+  # says.
+  #
+  # The statement is prepared once and kept, by its SQL text, among the
+  # connection's `statement_cache_size` most recently used. One the server
+  # no longer has (SQLSTATE 26000), or says changed under it (0A000, a
+  # table altered) outside a transaction, is prepared again and the call
+  # retried once; inside a transaction the 0A000 is raised (the
+  # transaction is aborted), and the next call prepares it again.
+  def query(sql: String, params: Array[Object?] = []) -> Result = run_query(sql, params, true)
+
+  private def run_query(sql: String, params: Array[Object?], again: Bool) -> Result
     values = params.map { |p| Connection.encode(p) }
     columns: Array[Field] = []
     rows: Array[Row] = []
     tag = ""
-    request = Frontend.parse("", sql) + Frontend.bind("", "", values) + Frontend.describe_portal("") +
-              Frontend.execute("") + Frontend.sync
-    converse(request) do |m|
-      case m
-      in Backend::ParseComplete | Backend::BindComplete | Backend::NoData | Backend::EmptyQueryResponse
-        nil
-      in Backend::RowDescription(fields:)
-        columns = fields
-      in Backend::DataRow(values:)
-        rows = rows.push(Row.new(columns, values))
-      in Backend::CommandComplete(tag: t)
-        tag = t
-      else
-        unexpected(m, "in an extended query")
+    cached = @statements.enabled? ? @statements.lookup(sql) : nil
+    name = cached || (@statements.enabled? ? @statements.next_name : "")
+    # The messages that may raise (a NUL in the SQL, too many parameters)
+    # are made before the cache gives up the statements it evicts.
+    body = (cached ? Bytes.new : Frontend.parse(name, sql)) + Frontend.bind("", name, values) +
+           Frontend.describe_portal("") + Frontend.execute("") + Frontend.sync
+    @statements.make_room if @statements.enabled? && !cached
+    b = Bytes::Builder.new
+    @statements.take_closes.each { |n| b << Frontend.close_statement(n) }
+    b << body
+    parsed = false
+    begin
+      converse(b.to_bytes) do |m|
+        case m
+        in Backend::ParseComplete
+          parsed = true
+        in Backend::BindComplete | Backend::NoData | Backend::EmptyQueryResponse | Backend::CloseComplete
+          nil
+        in Backend::RowDescription(fields:)
+          columns = fields
+        in Backend::DataRow(values:)
+          rows = rows.push(Row.new(columns, values))
+        in Backend::CommandComplete(tag: t)
+          tag = t
+        else
+          unexpected(m, "in an extended query")
+        end
       end
+    rescue ServerError => e
+      if cached
+        stale = case e.code
+                when "26000"
+                  @statements.drop(sql)
+                  true
+                when "0A000"
+                  @statements.forget(sql)
+                  @status == "I"
+                else
+                  false
+                end
+        return run_query(sql, params, false) if stale && again
+      end
+      raise e
+    ensure
+      # Prepared on the server, whatever came after (an execution error, a
+      # notice handler's exception): the statement stays good.
+      @statements.add(sql, name) if !cached && parsed && name != ""
     end
+    # The server dropped every prepared statement.
+    @statements.clear if tag == "DISCARD ALL" || tag == "DEALLOCATE ALL"
     Result.new(columns, rows, tag)
   end
+
+  # How many prepared statements the connection keeps.
+  def prepared_statements -> Int = @statements.size
 
   # Runs the block in a transaction: BEGIN, then COMMIT when the block
   # returns, or ROLLBACK when it raises (the exception goes on) or leaves

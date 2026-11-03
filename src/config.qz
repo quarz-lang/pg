@@ -15,7 +15,10 @@ data Config = (
   # How long connecting and authenticating may take (nil: no limit).
   connect_timeout: Duration?,
   # The most SCRAM iterations the server may ask for (`PG::Scram`).
-  max_scram_iterations: Int
+  max_scram_iterations: Int,
+  # How many prepared statements `PG::Connection#query` keeps (0: none,
+  # as a pooler in transaction mode needs).
+  statement_cache_size: Int
 )
 
 # Reads a connection URL, as libpq does:
@@ -23,8 +26,8 @@ data Config = (
 # (`postgresql://` too). The parts are percent-decoded; `host` may be a
 # socket directory (`%2Fvar%2Frun%2Fpostgresql`, or `?host=/var/run/...`);
 # the parameters `host`, `port`, `user`, `password`, `dbname`,
-# `application_name`, `connect_timeout` (seconds), `max_scram_iterations`
-# and `sslmode` are read. `sslmode` may be `disable`, `allow` or `prefer` (this client has
+# `application_name`, `connect_timeout` (seconds), `max_scram_iterations`,
+# `statement_cache_size` and `sslmode` are read. `sslmode` may be `disable`, `allow` or `prefer` (this client has
 # no TLS yet, so they all mean a plain connection); anything stronger
 # raises `ArgumentError`, as does a malformed URL.
 #
@@ -54,6 +57,7 @@ public def parse_url(url: String) -> Config
   application_name: String? = nil
   connect_timeout: Duration? = nil
   max_scram_iterations = Scram::MAX_ITERATIONS
+  statement_cache_size = Connection::STATEMENT_CACHE_SIZE
   (m[5] || "").split("&").each do |pair|
     next if pair.empty?
     key, _, value = pair.partition("=")
@@ -71,6 +75,9 @@ public def parse_url(url: String) -> Config
     when "max_scram_iterations"
       raise ArgumentError.new("max_scram_iterations: #{value.inspect}") unless value.match?(/\A[1-9][0-9]{0,9}\z/)
       max_scram_iterations = value.to_i
+    when "statement_cache_size"
+      raise ArgumentError.new("statement_cache_size: #{value.inspect}") unless value.match?(/\A[0-9]{1,6}\z/)
+      statement_cache_size = value.to_i
     when "sslmode"
       unless ["disable", "allow", "prefer"].include?(value)
         raise ArgumentError.new("sslmode=#{value}: this client has no TLS yet")
@@ -82,7 +89,8 @@ public def parse_url(url: String) -> Config
   Config.new(host: host.empty? ? "localhost" : host, port: port,
              user: user || Config.default_user, password: password, database: database,
              application_name: application_name, allow_cleartext: false,
-             connect_timeout: connect_timeout, max_scram_iterations: max_scram_iterations)
+             connect_timeout: connect_timeout, max_scram_iterations: max_scram_iterations,
+             statement_cache_size: statement_cache_size)
 end
 
 extension Config

@@ -1,0 +1,95 @@
+# The prepared statements of a connection, by their SQL: the least
+# recently used is closed when there are more than the capacity. Its
+# names are `qz1`, `qz2`, ... Used by `PG::Connection#query`.
+#
+# ```
+# cache = PG::StatementCache.new(2)
+# cache.add("SELECT 1")   # => "qz1"
+# cache.add("SELECT 2")   # => "qz2"
+# cache.lookup("SELECT 1")   # => "qz1"
+# cache.add("SELECT 3")   # => "qz3"
+# cache.take_closes       # => ["qz2"]
+# ```
+class StatementCache
+  @capacity: Int
+  var @names: Hash[String, String] = {}
+  # The SQL texts, least recently used first.
+  var @order: Array[String] = []
+  var @counter: Int = 0
+  var @to_close: Array[String] = []
+
+  # A cache of at most `capacity` statements (0: none, every query is
+  # parsed afresh as the unnamed statement).
+  def initialize(@capacity: Int); end
+
+  # Whether the cache keeps statements at all.
+  def enabled? -> Bool = @capacity > 0
+
+  # The number of statements kept.
+  def size -> Int = @order.size
+
+  # The name of the statement prepared for `sql`, if any, which becomes
+  # the most recently used.
+  def lookup(sql: String) -> String?
+    name = @names[sql]?
+    @order = @order.reject { |s| s == sql }.push(sql) if name
+    name
+  end
+
+  # A name for a new statement, not used yet.
+  def next_name -> String
+    @counter += 1
+    "qz#{@counter}"
+  end
+
+  # Keeps `sql` prepared as `name` (a new name if none is given), and
+  # returns the name; the least recently used statement beyond the
+  # capacity is queued to be closed.
+  def add(sql: String, name: String? = nil) -> String
+    n = name || next_name
+    @names = @names.put(sql, n)
+    @order = @order.reject { |s| s == sql }.push(sql)
+    while @order.size > @capacity && !@order.empty?
+      forget(@order[0])
+    end
+    n
+  end
+
+  # Makes room for one more statement: the least recently used beyond
+  # the capacity is queued to be closed, so that the request preparing
+  # the new one closes it first.
+  def make_room -> Void
+    while @order.size >= @capacity && !@order.empty?
+      forget(@order[0])
+    end
+  end
+
+  # Drops `sql`'s statement, queuing it to be closed on the server.
+  def forget(sql: String) -> Void
+    if (name = @names[sql]?)
+      @to_close = @to_close.push(name)
+    end
+    drop(sql)
+  end
+
+  # Drops `sql`'s statement without closing it (the server has none).
+  def drop(sql: String) -> Void
+    @names = @names.reject { |k, _| k == sql }
+    @order = @order.reject { |s| s == sql }
+  end
+
+  # Drops every statement without closing them (`DISCARD ALL`,
+  # `DEALLOCATE ALL`: the server closed them).
+  def clear -> Void
+    @names = {}
+    @order = []
+    @to_close = []
+  end
+
+  # The statements to close, which are then forgotten.
+  def take_closes -> Array[String]
+    names = @to_close
+    @to_close = []
+    names
+  end
+end

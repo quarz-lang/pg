@@ -51,7 +51,13 @@ password); `PG::ConnectionError` (with `PG::AuthenticationError` and
 used any further; `PG::TransactionError` and `PG::NullError` are misuses.
 
 
-Next: a prepared-statement cache, a connection pool.
+- `query` prepares each SQL text once and keeps the
+  `statement_cache_size` (default 100; 0 for a pooler in transaction
+  mode) most recently used statements; one the server no longer has
+  (26000) or says changed under it (0A000, outside a transaction) is
+  prepared again and the call retried once.
+
+Next: a connection pool.
 
 Not yet: TLS, LISTEN/NOTIFY as an API, COPY, cancel requests.
 

@@ -63,7 +63,8 @@ For now, to be revisited:
 - The default user is `$PGUSER`, then `$USER` (libpq: the operating
   system's user name).
 - No TLS: `sslmode` may be `disable`, `allow` or `prefer` only.
-- A SCRAM iteration count above 1,000,000 is refused.
+- A SCRAM iteration count above 1,000,000 is refused unless the
+  connection raises `max_scram_iterations` (keyword or URL parameter).
 
 ## Development
 

@@ -158,6 +158,13 @@ class ConnectionFailureTest < Test::Case
     server.close
   end
 
+  def test_max_scram_iterations_in_url
+    assert_equal(1_000_000, PG.parse_url("postgres://h/d").max_scram_iterations)
+    assert_equal(5_000_000, PG.parse_url("postgres://h/d?max_scram_iterations=5000000").max_scram_iterations)
+    assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?max_scram_iterations=0") }
+    assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?max_scram_iterations=x") }
+  end
+
   def test_url_errors_hide_the_password
     e = assert_raise(ArgumentError) { PG.parse_url("postgres://u:p#ss@h/db") }
     assert_false(e.message.include?("p#ss"))

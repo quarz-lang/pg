@@ -8,12 +8,14 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 # Connects as `PG.connect(url)` does, from keywords: `host` is a host name
 # or address, or a directory holding the server's unix socket (a path
 # starting with `/`). A password is sent in clear only over a unix socket,
-# or when `allow_cleartext` says so.
+# or when `allow_cleartext` says so. `max_scram_iterations` is the most
+# SCRAM iterations the server may ask for.
 public def connect(*, host: String = "localhost", port: Int = 5432, user: String = Config.default_user,
                    password: String? = nil, database: String? = nil, application_name: String? = nil,
-                   allow_cleartext: Bool = false, connect_timeout: Duration? = nil) -> Connection
+                   allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
+                   max_scram_iterations: Int = Scram::MAX_ITERATIONS) -> Connection
   Connection.open(Config.new(host:, port:, user:, password:, database:, application_name:,
-                             allow_cleartext:, connect_timeout:))
+                             allow_cleartext:, connect_timeout:, max_scram_iterations:))
 end
 
 # A session with the server: one task's at a time.
@@ -363,7 +365,7 @@ class Connection
                                         "and this client speaks #{Scram::MECHANISM} only")
         end
         refuse_after_sasl(scram)
-        s = Scram.new(password)
+        s = Scram.new(password, max_iterations: @config.max_scram_iterations)
         scram = s
         send(Frontend.sasl_initial_response(Scram::MECHANISM, s.client_first.to_bytes))
       in Backend::AuthenticationSASLContinue(data:)

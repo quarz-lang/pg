@@ -41,6 +41,21 @@ class ScramTest < Test::Case
     end
   end
 
+  def test_iteration_cap_raised
+    s = PG::Scram.new("pencil", nonce: "rOprNGfwEbeRWgbNEkqO", user: "user", max_iterations: 4095)
+    assert_raise_message(/4096 iterations, more than the 4095 allowed \(raise the connection's max_scram_iterations/) do
+      s.client_final(SERVER_FIRST)
+    end
+    s = PG::Scram.new("pencil", nonce: "rOprNGfwEbeRWgbNEkqO", user: "user", max_iterations: 2_000_000)
+    assert_equal(CLIENT_FINAL, s.client_final(SERVER_FIRST))
+  end
+
+  # Above BLOCKING_ITERATIONS the hashing runs on a helper thread: the same
+  # bytes.
+  def test_salted_password_on_a_helper_thread
+    assert_equal(Digest::PBKDF2.sha256("pw", b"salt", 20_000, 32), PG::Scram.salted_password("pw", b"salt", 20_000))
+  end
+
   def test_verify_before_final
     assert_raise(PG::AuthenticationError) { scram.verify(SERVER_FINAL) }
   end

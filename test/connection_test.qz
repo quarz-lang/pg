@@ -1,0 +1,179 @@
+require "test"
+require_relative "server"
+
+# Against a real server (test/server.qz): connecting and authenticating.
+class ConnectionTest < Test::Case
+  SERVER = Atom[TestServer | String].new("not started")
+
+  def self.startup
+    SERVER.set(TestServer.start)
+  end
+
+  def self.shutdown
+    case SERVER.get
+    in TestServer => s then s.stop
+    else nil
+    end
+  end
+
+  def server -> TestServer
+    case SERVER.get
+    in TestServer => s then s
+    in String => why then omit(why)
+    end
+  end
+
+  def test_scram_over_tcp
+    c = PG.connect(server.url)
+    assert_false(c.server_version.empty?)
+    assert_equal("UTF8", c.parameters["client_encoding"]?)
+    assert_true(c.process_id > 0)
+    assert_equal(:idle, c.transaction_status)
+    assert_false(c.closed?)
+    c.close
+    assert_true(c.closed?)
+    c.close
+  end
+
+  def test_keywords_and_application_name
+    config = PG.parse_url(server.url)
+    c = PG.connect(host: config.host, port: config.port, user: config.user, password: config.password,
+                   database: "postgres", application_name: "pg-test")
+    assert_equal("pg-test", c.parameters["application_name"]?)
+    c.close
+  end
+
+  def test_unix_socket
+    dir = server.socket_dir || omit("PG_TEST_URL's server: its socket is not known")
+    c = PG.connect(host: dir, port: server.port, user: "quarz", password: server.password, database: "postgres")
+    assert_false(c.server_version.empty?)
+    c.close
+  end
+
+  def test_wrong_password
+    config = PG.parse_url(server.url)
+    e = assert_raise(PG::Error) do
+      PG.connect(host: config.host, port: config.port, user: config.user, password: "wrong")
+    end.as(PG::Error)
+    assert_equal("28P01", e.code)
+    assert_equal("FATAL", e.severity)
+  end
+
+  def test_no_password
+    config = PG.parse_url(server.url)
+    assert_raise_message(/asks for a password/) do
+      PG.connect(host: config.host, port: config.port, user: config.user)
+    end
+  end
+
+  def test_missing_database
+    config = PG.parse_url(server.url)
+    e = assert_raise(PG::Error) do
+      PG.connect(host: config.host, port: config.port, user: config.user, password: config.password,
+                 database: "no_such_database_here")
+    end.as(PG::Error)
+    assert_equal("3D000", e.code)
+  end
+end
+
+# Without a server: what the client does when the other end is not one.
+class ConnectionFailureTest < Test::Case
+  def test_nothing_listening
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.local_address.port
+    server.close
+    assert_raise(PG::ConnectionError) { PG.connect(host: "127.0.0.1", port: port, user: "u") }
+  end
+
+  def test_silent_server_times_out
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.local_address.port
+    Task.scope do |scope|
+      scope.spawn do
+        peer = server.accept
+        Task.sleep(2.seconds)
+        peer.close
+      end
+      started = Process.clock
+      assert_raise_message(/no answer from 127.0.0.1:\d+ within/) do
+        PG.connect(host: "127.0.0.1", port: port, user: "u", connect_timeout: 200.ms)
+      end
+      assert_true(Process.clock - started < 1.5)
+    end
+    server.close
+  end
+
+  def test_not_postgres
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.local_address.port
+    Task.scope do |scope|
+      scope.spawn do
+        peer = server.accept
+        peer.read_bytes(8)
+        peer.write("HTTP/1.1 400 Bad Request\r\n\r\n")
+        peer.close
+      end
+      assert_raise(PG::ProtocolError) { PG.connect(host: "127.0.0.1", port: port, user: "u") }
+    end
+    server.close
+  end
+
+  def test_cleartext_over_tcp_refused
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.local_address.port
+    Task.scope do |scope|
+      scope.spawn do
+        peer = server.accept
+        peer.read_bytes(4)
+        peer.write(b"R\x00\x00\x00\x08\x00\x00\x00\x03")
+        Task.sleep(100.ms)
+        peer.close
+      end
+      assert_raise_message(/in clear over TCP/) do
+        PG.connect(host: "127.0.0.1", port: port, user: "u", password: "secret")
+      end
+    end
+    server.close
+  end
+
+  # A server (or a man in the middle) that takes the client's proof and
+  # says Ok without proving that it knows the password.
+  def test_scram_ok_without_final_refused
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.local_address.port
+    Task.scope do |scope|
+      scope.spawn do
+        peer = server.accept
+        peer.read_bytes(4)
+        peer.write(PG::Wire.frame('R'.ord, b"\x00\x00\x00\x0aSCRAM-SHA-256\x00\x00"))
+        peer.read_bytes(5)
+        peer.write(PG::Wire.frame('R'.ord, b"\x00\x00\x00\x00"))
+        Task.sleep(100.ms)
+        peer.close
+      end
+      assert_raise_message(/without proving/) do
+        PG.connect(host: "127.0.0.1", port: port, user: "u", password: "secret")
+      end
+    end
+    server.close
+  end
+
+  def test_max_scram_iterations_in_url
+    assert_equal(1_000_000, PG.parse_url("postgres://h/d").max_scram_iterations)
+    assert_equal(5_000_000, PG.parse_url("postgres://h/d?max_scram_iterations=5000000").max_scram_iterations)
+    assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?max_scram_iterations=0") }
+    assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?max_scram_iterations=x") }
+  end
+
+  def test_url_errors_hide_the_password
+    e = assert_raise(ArgumentError) { PG.parse_url("postgres://u:p#ss@h/db") }
+    assert_false(e.message.include?("p#ss"))
+    e = assert_raise(ArgumentError) { PG.parse_url("postgres://u:50%off@h/db") }
+    assert_false(e.message.include?("50%off"))
+  end
+
+  def test_md5_password
+    # md5(md5(password + user) + salt), computed with Python's hashlib.
+    assert_equal("md59009ce60b9ca97f1e752376843d1309e", PG::Connection.md5_password("ann", "secret", b"\x01\x02\x03\x04"))
+  end
+end

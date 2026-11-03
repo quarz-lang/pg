@@ -1,0 +1,79 @@
+require "test"
+
+# RFC 7677 §3's example exchange.
+class ScramTest < Test::Case
+  SERVER_FIRST = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+  CLIENT_FINAL = "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+  SERVER_FINAL = "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+
+  def scram -> PG::Scram = PG::Scram.new("pencil", nonce: "rOprNGfwEbeRWgbNEkqO", user: "user")
+
+  def test_rfc7677_exchange
+    s = scram
+    assert_equal("n,,n=user,r=rOprNGfwEbeRWgbNEkqO", s.client_first)
+    assert_equal(CLIENT_FINAL, s.client_final(SERVER_FIRST))
+    assert_false(s.verified?)
+    assert_nothing_raised { s.verify(SERVER_FINAL) }
+    assert_true(s.verified?)
+  end
+
+  def test_postgres_form
+    s = PG::Scram.new("pw")
+    assert_match(/\An,,n=,r=[A-Za-z0-9+\/]{24}\z/, s.client_first)
+    assert_false(s.client_first == PG::Scram.new("pw").client_first)
+  end
+
+  def test_user_name_escaped
+    assert_equal("n,,n=a=2Cb=3D,r=x", PG::Scram.new("p", nonce: "x", user: "a,b=").client_first)
+  end
+
+  def test_wrong_server_signature
+    s = scram
+    s.client_final(SERVER_FIRST)
+    assert_raise_message(/does not match/) { s.verify("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") }
+    assert_raise_message(/refused: invalid-proof/) { s.verify("e=invalid-proof") }
+    assert_raise(PG::AuthenticationError) { s.verify("x=1") }
+  end
+
+  def test_iteration_cap
+    assert_raise_message(/1000001 iterations, more than the 1000000 allowed/) do
+      scram.client_final("r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000001")
+    end
+  end
+
+  def test_iteration_cap_raised
+    s = PG::Scram.new("pencil", nonce: "rOprNGfwEbeRWgbNEkqO", user: "user", max_iterations: 4095)
+    assert_raise_message(/4096 iterations, more than the 4095 allowed \(raise the connection's max_scram_iterations/) do
+      s.client_final(SERVER_FIRST)
+    end
+    s = PG::Scram.new("pencil", nonce: "rOprNGfwEbeRWgbNEkqO", user: "user", max_iterations: 2_000_000)
+    assert_equal(CLIENT_FINAL, s.client_final(SERVER_FIRST))
+  end
+
+  # Above BLOCKING_ITERATIONS the hashing runs on a helper thread: the same
+  # bytes.
+  def test_salted_password_on_a_helper_thread
+    assert_equal(Digest::PBKDF2.sha256("pw", b"salt", 20_000, 32), PG::Scram.salted_password("pw", b"salt", 20_000))
+  end
+
+  def test_verify_before_final
+    assert_raise(PG::AuthenticationError) { scram.verify(SERVER_FINAL) }
+  end
+
+  def test_malformed_server_first
+    ["s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+     "r=rOprNGfwEbeRWgbNEkqO,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+     "r=other%x,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+     "r=rOprNGfwEbeRWgbNEkqOx,i=4096",
+     "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==",
+     "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=0",
+     "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4x",
+     "r=rOprNGfwEbeRWgbNEkqOx,s=!!,i=4096",
+     "r=rOprNGfwEbeRWgbNEkqOx,r=rOprNGfwEbeRWgbNEkqOy,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+     "m=ext,r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+     "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000001",
+     "garbage"].each do |m|
+      assert_raise(PG::AuthenticationError) { scram.client_final(m) }
+    end
+  end
+end

@@ -1,0 +1,256 @@
+# Connects to the server `url` names (`PG.parse_url` reads it), and
+# authenticates. Raises `PG::Error` when the server refuses (a wrong
+# password, a missing database), `PG::AuthenticationError` when this
+# client cannot authenticate as the server asks, and `PG::ConnectionError`
+# when the server cannot be reached or does not answer in time.
+public def connect(url: String) -> Connection = Connection.open(parse_url(url))
+
+# Connects as `PG.connect(url)` does, from keywords: `host` is a host name
+# or address, or a directory holding the server's unix socket (a path
+# starting with `/`). A password is sent in clear only over a unix socket,
+# or when `allow_cleartext` says so. `max_scram_iterations` is the most
+# SCRAM iterations the server may ask for.
+public def connect(*, host: String = "localhost", port: Int = 5432, user: String = Config.default_user,
+                   password: String? = nil, database: String? = nil, application_name: String? = nil,
+                   allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
+                   max_scram_iterations: Int = Scram::MAX_ITERATIONS) -> Connection
+  Connection.open(Config.new(host:, port:, user:, password:, database:, application_name:,
+                             allow_cleartext:, connect_timeout:, max_scram_iterations:))
+end
+
+# A session with the server: one task's at a time.
+class Connection
+  @config: Config
+  @io: IO
+  @reader: MessageReader
+  var @parameters: Hash[String, String] = {}
+  var @process_id: Int = 0
+  var @secret: Bytes = Bytes.new
+  var @status: String = "I"
+  var @closed: Bool = false
+
+  # Connects with `config` and authenticates (see `PG.connect`).
+  def self.open(config: Config) -> Connection
+    if (limit = config.connect_timeout)
+      begin
+        Task.timeout(limit) { start(config) }
+      rescue Task::Timeout
+        raise ConnectionError.new("no answer from #{Connection.where(config)} within #{limit}")
+      end
+    else
+      start(config)
+    end
+  end
+
+  private def self.start(config: Config) -> Connection
+    io = begin
+      if config.host.start_with?("/")
+        UNIXSocket.new("#{config.host}/.s.PGSQL.#{config.port}")
+      else
+        Socket.tcp(config.host, config.port)
+      end
+    rescue SystemCallError, SocketError, IOError => e
+      raise ConnectionError.new("cannot connect to #{Connection.where(config)}: #{e.message}")
+    end
+    conn = Connection.new(config, io)
+    begin
+      conn.startup
+    rescue Exception => e
+      io.close
+      raise e
+    end
+    conn
+  end
+
+  # Where `config` points, for messages.
+  def self.where(config: Config) -> String
+    config.host.start_with?("/") ? "#{config.host}/.s.PGSQL.#{config.port}" : "#{config.host}:#{config.port}"
+  end
+
+  # What `md5` authentication sends: `md5` and the hex digest of the hex
+  # digest of `password` and `user`, then `salt`.
+  def self.md5_password(user: String, password: String, salt: Bytes) -> String
+    "md5" + Digest::MD5.hexdigest(Digest::MD5.hexdigest(password + user).to_bytes + salt)
+  end
+
+  # A connection over `io`, not started: `PG.connect` makes them.
+  def initialize(@config: Config, @io: IO)
+    @reader = MessageReader.new(io)
+  end
+
+  # The run-time parameters the server reported (server_version,
+  # TimeZone, client_encoding, standard_conforming_strings, ...),
+  # kept up to date.
+  def parameters -> Hash[String, String] = @parameters
+
+  # The server's version, as `server_version` reports it (`"17.11 (Debian
+  # 17.11-0+deb13u1)"`).
+  def server_version -> String = @parameters["server_version"]? || ""
+
+  # The server process serving this session.
+  def process_id -> Int = @process_id
+
+  # `:idle`, `:in_transaction` or `:failed` (a transaction an error
+  # aborted), as of the last time the server was ready.
+  def transaction_status -> Symbol
+    case @status
+    when "T" then :in_transaction
+    when "E" then :failed
+    else :idle
+    end
+  end
+
+  # Whether `#close` was called, or the connection broke.
+  def closed? -> Bool = @closed
+
+  # Ends the session: tells the server, and closes the socket. Closing a
+  # closed connection does nothing.
+  def close -> Void
+    return if @closed
+    @closed = true
+    begin
+      @io.write(Frontend.terminate)
+    rescue IOError, SystemCallError
+    end
+    close_io
+  end
+
+  # The startup exchange: authentication, then the session's parameters,
+  # up to the first ReadyForQuery. Called by `PG.connect`.
+  def startup -> Void
+    params = { "user" => @config.user, "client_encoding" => "UTF8" }
+    if (db = @config.database)
+      params = params.put("database", db)
+    end
+    if (app = @config.application_name)
+      params = params.put("application_name", app)
+    end
+    send(Frontend.startup(params))
+    authenticate
+    loop do
+      case m = receive
+      in Backend::ReadyForQuery(status:)
+        @status = status
+        break
+      in Backend::BackendKeyData(process_id:, secret:)
+        @process_id = process_id
+        @secret = secret
+      in Backend::NegotiateProtocolVersion
+        # Protocol 3.0 asked for and spoken; only options went unknown.
+        nil
+      else
+        unexpected(m, "while starting")
+      end
+    end
+  end
+
+  private def authenticate -> Void
+    scram: Scram? = nil
+    loop do
+      case m = receive
+      in Backend::AuthenticationOk
+        if (s = scram) && !s.verified?
+          raise AuthenticationError.new("the server ended SCRAM without proving that it knows the password")
+        end
+        break
+      in Backend::AuthenticationCleartextPassword
+        refuse_after_sasl(scram)
+        unless @config.host.start_with?("/") || @config.allow_cleartext
+          raise AuthenticationError.new("the server asks for the password in clear over TCP; " +
+                                        "pass allow_cleartext: true to send it so")
+        end
+        send(Frontend.password(password))
+      in Backend::AuthenticationMD5Password(salt:)
+        refuse_after_sasl(scram)
+        send(Frontend.password(Connection.md5_password(@config.user, password, salt)))
+      in Backend::AuthenticationSASL(mechanisms:)
+        unless mechanisms.include?(Scram::MECHANISM)
+          raise AuthenticationError.new("the server offers SASL with #{mechanisms.join(", ")}, " +
+                                        "and this client speaks #{Scram::MECHANISM} only")
+        end
+        refuse_after_sasl(scram)
+        s = Scram.new(password, max_iterations: @config.max_scram_iterations)
+        scram = s
+        send(Frontend.sasl_initial_response(Scram::MECHANISM, s.client_first.to_bytes))
+      in Backend::AuthenticationSASLContinue(data:)
+        s = scram || unexpected(m, "before SASL started")
+        send(Frontend.sasl_response(s.client_final(text(data)).to_bytes))
+      in Backend::AuthenticationSASLFinal(data:)
+        s = scram || unexpected(m, "before SASL started")
+        s.verify(text(data))
+      in Backend::AuthenticationOther(code:)
+        raise AuthenticationError.new("the server asks for an authentication method this client " +
+                                      "does not speak (code #{code}: Kerberos, GSSAPI or SSPI)")
+      else
+        unexpected(m, "while authenticating")
+      end
+    end
+  end
+
+  # A server that started SCRAM and then asks for a weaker method is not
+  # followed.
+  private def refuse_after_sasl(scram: Scram?) -> Void
+    raise AuthenticationError.new("the server changed the authentication method during SCRAM") if scram
+  end
+
+  private def password -> String
+    @config.password || raise(AuthenticationError.new("the server asks for a password, and none was given"))
+  end
+
+  private def text(data: Bytes) -> String
+    data.decode? || raise(ProtocolError.new("SASL data that is not UTF-8"))
+  end
+
+  # Sends `bytes`; a failure breaks the connection.
+  private def send(bytes: Bytes) -> Void
+    raise ConnectionError.new("the connection is closed") if @closed
+    @io.write(bytes)
+  rescue IOError, SystemCallError => e
+    broken(e.message)
+  end
+
+  # The next message that is not about the session itself: parameter
+  # changes are recorded, notices dropped, and an error is raised as a
+  # `PG::Error`.
+  private def receive -> Backend
+    loop do
+      m = begin
+        @reader.read
+      rescue ConnectionError => e
+        # The end of the stream, or bytes that are not the protocol.
+        @closed = true
+        close_io
+        raise e
+      rescue IOError, SystemCallError => e
+        broken(e.message)
+      end
+      case m
+      in Backend::ParameterStatus(name:, value:)
+        @parameters = @parameters.put(name, value)
+      in Backend::NoticeResponse
+        nil
+      in Backend::ErrorResponse(fields:)
+        raise Error.new(fields)
+      else
+        return m
+      end
+    end
+  end
+
+  private def broken(message: String) -> Nothing
+    @closed = true
+    close_io
+    raise ConnectionError.new(message)
+  end
+
+  private def close_io -> Void
+    @io.close
+  rescue IOError, SystemCallError
+  end
+
+  private def unexpected(m: Backend, context: String) -> Nothing
+    @closed = true
+    close_io
+    raise ProtocolError.new("unexpected #{m.class.name.split("::").last} #{context}")
+  end
+end

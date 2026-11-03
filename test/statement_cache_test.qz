@@ -1,0 +1,43 @@
+require "test"
+
+class StatementCacheTest < Test::Case
+  def test_lru_eviction
+    c = PG::StatementCache.new(2)
+    assert_equal("qz1", c.add("a"))
+    assert_equal("qz2", c.add("b"))
+    assert_equal("qz1", c.lookup("a"))
+    assert_equal("qz3", c.add("c"))
+    assert_equal(["qz2"], c.take_closes)
+    assert_true(c.take_closes.empty?)
+    assert_nil(c.lookup("b"))
+    assert_equal(2, c.size)
+  end
+
+  def test_forget_drop_clear
+    c = PG::StatementCache.new(10)
+    c.add("a")
+    c.add("b")
+    c.forget("a")
+    c.drop("b")
+    assert_equal(["qz1"], c.take_closes)
+    assert_equal(0, c.size)
+    c.add("x")
+    c.forget("x")
+    c.clear
+    assert_true(c.take_closes.empty?)
+  end
+
+  def test_make_room
+    c = PG::StatementCache.new(2)
+    c.add("a")
+    c.add("b")
+    c.make_room
+    assert_equal(["qz1"], c.take_closes)
+    assert_equal(1, c.size)
+  end
+
+  def test_disabled
+    c = PG::StatementCache.new(0)
+    assert_false(c.enabled?)
+  end
+end

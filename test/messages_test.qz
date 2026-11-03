@@ -1,0 +1,144 @@
+require "test"
+
+# Frontend messages, byte for byte (protocol 3.0, "Message Formats").
+class FrontendTest < Test::Case
+  def test_startup
+    m = PG::Frontend.startup({ "user" => "dev", "database" => "db" })
+    assert_equal(b"\x00\x00\x00\x1e\x00\x03\x00\x00user\x00dev\x00database\x00db\x00\x00", m)
+  end
+
+  def test_password
+    assert_equal(b"p\x00\x00\x00\x05\x00", PG::Frontend.password(""))
+    assert_equal(b"p\x00\x00\x00\x08abc\x00", PG::Frontend.password("abc"))
+  end
+
+  def test_sasl
+    assert_equal(b"p\x00\x00\x00\x17SCRAM-SHA-256\x00\x00\x00\x00\x01x",
+                 PG::Frontend.sasl_initial_response("SCRAM-SHA-256", b"x"))
+    assert_equal(b"p\x00\x00\x00\x0aM\x00\xff\xff\xff\xff", PG::Frontend.sasl_initial_response("M", nil))
+    assert_equal(b"p\x00\x00\x00\x06ab", PG::Frontend.sasl_response(b"ab"))
+  end
+
+  def test_query
+    assert_equal(b"Q\x00\x00\x00\x05\x00", PG::Frontend.query(""))
+    assert_raise(ArgumentError) { PG::Frontend.query("a\0b") }
+  end
+
+  def test_parse
+    assert_equal(b"P\x00\x00\x00\x10s1\x00select\x00\x00\x00", PG::Frontend.parse("s1", "select"))
+    assert_equal(b"P\x00\x00\x00\x0e\x00$1\x00\x00\x01\x00\x00\x00\x17", PG::Frontend.parse("", "$1", [23]))
+  end
+
+  def test_bind
+    m = PG::Frontend.bind("", "s1", [b"42", nil, Bytes.new])
+    expected = b"B\x00\x00\x00\x1c" + b"\x00" + b"s1\x00" + b"\x00\x00" + b"\x00\x03" +
+               b"\x00\x00\x00\x0242" + b"\xff\xff\xff\xff" + b"\x00\x00\x00\x00" + b"\x00\x00"
+    assert_equal(expected, m)
+  end
+
+  def test_describe_execute_close
+    assert_equal(b"D\x00\x00\x00\x08Ss1\x00", PG::Frontend.describe_statement("s1"))
+    assert_equal(b"D\x00\x00\x00\x06P\x00", PG::Frontend.describe_portal(""))
+    assert_equal(b"E\x00\x00\x00\x09\x00\x00\x00\x00\x00", PG::Frontend.execute(""))
+    assert_equal(b"E\x00\x00\x00\x09\x00\x00\x00\x00\x0a", PG::Frontend.execute("", 10))
+    assert_raise(ArgumentError) { PG::Frontend.execute("", -1) }
+    assert_raise(ArgumentError) { PG::Frontend.execute("", 0x8000_0000) }
+    assert_equal(b"C\x00\x00\x00\x08Ss1\x00", PG::Frontend.close_statement("s1"))
+    assert_equal(b"C\x00\x00\x00\x06P\x00", PG::Frontend.close_portal(""))
+  end
+
+  def test_sync_flush_terminate
+    assert_equal(b"S\x00\x00\x00\x04", PG::Frontend.sync)
+    assert_equal(b"H\x00\x00\x00\x04", PG::Frontend.flush)
+    assert_equal(b"X\x00\x00\x00\x04", PG::Frontend.terminate)
+  end
+end
+
+class BackendTest < Test::Case
+  def decode(type: String, body: Bytes) -> PG::Backend = PG::Backend.decode(type.ord, body)
+
+  def test_authentication
+    assert_equal[PG::Backend](PG::Backend::AuthenticationOk, decode("R", b"\x00\x00\x00\x00"))
+    assert_equal[PG::Backend](PG::Backend::AuthenticationCleartextPassword, decode("R", b"\x00\x00\x00\x03"))
+    assert_equal[PG::Backend](PG::Backend::AuthenticationMD5Password.new(b"\x01\x02\x03\x04"),
+                              decode("R", b"\x00\x00\x00\x05\x01\x02\x03\x04"))
+    assert_equal[PG::Backend](PG::Backend::AuthenticationSASL.new(["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"]),
+                              decode("R", b"\x00\x00\x00\x0aSCRAM-SHA-256-PLUS\x00SCRAM-SHA-256\x00\x00"))
+    assert_equal[PG::Backend](PG::Backend::AuthenticationSASLContinue.new(b"r=abc"), decode("R", b"\x00\x00\x00\x0br=abc"))
+    assert_equal[PG::Backend](PG::Backend::AuthenticationSASLFinal.new(b"v=xyz"), decode("R", b"\x00\x00\x00\x0cv=xyz"))
+    assert_equal[PG::Backend](PG::Backend::AuthenticationOther.new(7), decode("R", b"\x00\x00\x00\x07"))
+    assert_equal[PG::Backend](PG::Backend::AuthenticationOther.new(8), decode("R", b"\x00\x00\x00\x08gss"))
+  end
+
+  def test_session_messages
+    assert_equal[PG::Backend](PG::Backend::ParameterStatus.new("server_version", "17.11"),
+                              decode("S", b"server_version\x0017.11\x00"))
+    assert_equal[PG::Backend](PG::Backend::BackendKeyData.new(1234, b"\x0a\x0b\x0c\x0d"),
+                              decode("K", b"\x00\x00\x04\xd2\x0a\x0b\x0c\x0d"))
+    assert_raise(PG::ProtocolError) { decode("K", b"\x00\x00\x04\xd2") }
+    assert_raise(PG::ProtocolError) { decode("K", b"\x00\x00\x04\xd2" + Bytes.from([0] * 257)) }
+    assert_equal[PG::Backend](PG::Backend::ReadyForQuery.new("T"), decode("Z", b"T"))
+    assert_raise(PG::ProtocolError) { decode("Z", b"X") }
+    assert_equal[PG::Backend](PG::Backend::NegotiateProtocolVersion.new(0, ["_pq_.x"]),
+                              decode("v", b"\x00\x00\x00\x00\x00\x00\x00\x01_pq_.x\x00"))
+  end
+
+  def test_rows
+    body = b"\x00\x02" + b"id\x00\x00\x00\x40\x01\x00\x01\x00\x00\x00\x17\x00\x04\xff\xff\xff\xff\x00\x00" +
+           b"?column?\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x19\xff\xff\xff\xff\xff\xff\x00\x00"
+    fields = [PG::Field.new("id", 16385, 1, 23, 4, -1, 0), PG::Field.new("?column?", 0, 0, 25, -1, -1, 0)]
+    assert_equal[PG::Backend](PG::Backend::RowDescription.new(fields), decode("T", body))
+    assert_equal[PG::Backend](PG::Backend::DataRow.new([b"1", nil, Bytes.new]),
+                              decode("D", b"\x00\x03\x00\x00\x00\x011\xff\xff\xff\xff\x00\x00\x00\x00"))
+    assert_equal[PG::Backend](PG::Backend::CommandComplete.new("SELECT 1"), decode("C", b"SELECT 1\x00"))
+    assert_equal[PG::Backend](PG::Backend::EmptyQueryResponse, decode("I", Bytes.new))
+  end
+
+  def test_errors_and_notices
+    body = b"SERROR\x00VERROR\x00C42P01\x00Mrelation \"x\" does not exist\x00P15\x00\x00"
+    fields = { "S" => "ERROR", "V" => "ERROR", "C" => "42P01", "M" => "relation \"x\" does not exist", "P" => "15" }
+    assert_equal[PG::Backend](PG::Backend::ErrorResponse.new(fields), decode("E", body))
+    assert_equal[PG::Backend](PG::Backend::NoticeResponse.new({ "M" => "hi" }), decode("N", b"Mhi\x00\x00"))
+  end
+
+  def test_extended_query_replies
+    assert_equal[PG::Backend](PG::Backend::ParseComplete, decode("1", Bytes.new))
+    assert_equal[PG::Backend](PG::Backend::BindComplete, decode("2", Bytes.new))
+    assert_equal[PG::Backend](PG::Backend::CloseComplete, decode("3", Bytes.new))
+    assert_equal[PG::Backend](PG::Backend::NoData, decode("n", Bytes.new))
+    assert_equal[PG::Backend](PG::Backend::PortalSuspended, decode("s", Bytes.new))
+    assert_equal[PG::Backend](PG::Backend::ParameterDescription.new([23, 25]),
+                              decode("t", b"\x00\x02\x00\x00\x00\x17\x00\x00\x00\x19"))
+  end
+
+  def test_unsigned_counts_and_oids
+    types = Bytes.build do |b|
+      b << 0x9c << 0x40
+      40000.times { b << 0 << 0 << 0 << 23 }
+    end
+    m = decode("t", types)
+    case m
+    in PG::Backend::ParameterDescription(types:)
+      assert_equal(40000, types.size)
+    else
+      flunk("not a ParameterDescription")
+    end
+    field = b"\x00\x01x\x00\x80\x00\x00\x01\x00\x01\xff\xff\xff\xfe\x00\x04\xff\xff\xff\xff\x00\x00"
+    assert_equal[PG::Backend](PG::Backend::RowDescription.new([PG::Field.new("x", 2147483649, 1, 4294967294, 4, -1, 0)]),
+                              decode("T", field))
+  end
+
+  def test_notification
+    assert_equal[PG::Backend](PG::Backend::NotificationResponse.new(7, "ch", "hello"),
+                              decode("A", b"\x00\x00\x00\x07ch\x00hello\x00"))
+  end
+
+  def test_malformed
+    assert_raise(PG::ProtocolError) { decode("?", Bytes.new) }
+    assert_raise(PG::ProtocolError) { decode("G", b"\x00\x00\x00") }
+    assert_raise_message(/after a "1" message/) { decode("1", b"x") }
+    assert_raise(PG::ProtocolError) { decode("C", b"SELECT 1") }
+    assert_raise(PG::ProtocolError) { decode("D", b"\x00\x01\x00\x00\x00\x05ab") }
+    assert_raise(PG::ProtocolError) { decode("D", b"\x00\x01\xff\xff\xff\xfe") }
+  end
+end

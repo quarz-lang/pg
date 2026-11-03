@@ -1,0 +1,119 @@
+require "test"
+
+class WireWriteTest < Test::Case
+  def b -> Bytes::Builder = Bytes::Builder.new
+
+  def test_int16
+    assert_equal(b"\x00\x00", PG::Wire.int16(b, 0).to_bytes)
+    assert_equal(b"\x7f\xff", PG::Wire.int16(b, 32767).to_bytes)
+    assert_equal(b"\x80\x00", PG::Wire.int16(b, -32768).to_bytes)
+    assert_equal(b"\xff\xff", PG::Wire.int16(b, 65535).to_bytes)
+    assert_raise(ArgumentError) { PG::Wire.int16(b, 65536) }
+    assert_raise(ArgumentError) { PG::Wire.int16(b, -32769) }
+  end
+
+  def test_int32
+    assert_equal(b"\x00\x03\x00\x00", PG::Wire.int32(b, 196608).to_bytes)
+    assert_equal(b"\x80\x00\x00\x00", PG::Wire.int32(b, -2147483648).to_bytes)
+    assert_equal(b"\xff\xff\xff\xfe", PG::Wire.int32(b, -2).to_bytes)
+    assert_equal(b"\xff\xff\xff\xff", PG::Wire.int32(b, 4294967295).to_bytes)
+    assert_raise(ArgumentError) { PG::Wire.int32(b, 4294967296) }
+    assert_raise(ArgumentError) { PG::Wire.int32(b, -2147483649) }
+  end
+
+  def test_cstring
+    assert_equal(b"\x00", PG::Wire.cstring(b, "").to_bytes)
+    assert_equal(b"\xc3\xa9\x00", PG::Wire.cstring(b, "é").to_bytes)
+    assert_raise(ArgumentError) { PG::Wire.cstring(b, "a\0b") }
+  end
+
+  def test_frame
+    assert_equal(b"X\x00\x00\x00\x04", PG::Wire.frame('X'.ord, Bytes.new))
+    assert_equal(b"\x00\x00\x00\x06ab", PG::Wire.frame(nil, b"ab"))
+  end
+end
+
+class WireReadTest < Test::Case
+  def test_integers
+    r = PG::Wire::Reader.new(b"\x01\x80\x00\x7f\xff\xff\xff\xff\x00\x00\x00\x00\x2a")
+    assert_equal(1, r.byte)
+    assert_equal(-32768, r.int16)
+    assert_equal(32767, r.int16)
+    assert_equal(-256, r.int32)
+    assert_equal(42, r.int32)
+    assert_true(r.done?)
+  end
+
+  def test_strings_and_bytes
+    r = PG::Wire::Reader.new(b"\x00caf\xc3\xa9\x00xyz")
+    assert_equal("", r.cstring)
+    assert_equal("café", r.cstring)
+    assert_equal(3, r.remaining)
+    assert_equal(b"x", r.bytes(1))
+    assert_equal(b"yz", r.rest)
+    assert_equal(Bytes.new, r.rest)
+  end
+
+  def test_past_the_end
+    assert_raise(PG::ProtocolError) { PG::Wire::Reader.new(b"\x00").int16 }
+    assert_raise(PG::ProtocolError) { PG::Wire::Reader.new(b"\x00\x00\x00").int32 }
+    assert_raise(PG::ProtocolError) { PG::Wire::Reader.new(b"abc").cstring }
+    assert_raise(PG::ProtocolError) { PG::Wire::Reader.new(b"ab").bytes(3) }
+    assert_raise(PG::ProtocolError) { PG::Wire::Reader.new(b"ab").bytes(-1) }
+    assert_raise(PG::ProtocolError) { PG::Wire::Reader.new(Bytes.new).byte }
+  end
+
+  def test_invalid_utf8
+    assert_raise(PG::ProtocolError) { PG::Wire::Reader.new(b"\xff\x00").cstring }
+  end
+end
+
+# A source that gives at most `chunk` bytes per read, as a socket may.
+class WireChunks
+  @data: Bytes
+  @chunk: Int
+  var @pos: Int = 0
+
+  def initialize(@data: Bytes, @chunk: Int); end
+
+  def read(n: Int) -> Bytes
+    k = n < @chunk ? n : @chunk
+    k = @data.size - @pos if @data.size - @pos < k
+    v = @data.slice(@pos, k)
+    @pos += k
+    v
+  end
+end
+
+class MessageReaderTest < Test::Case
+  STREAM = b"R\x00\x00\x00\x08\x00\x00\x00\x00" + b"S\x00\x00\x00\x15TimeZone\x00Etc/UTC\x00" + b"Z\x00\x00\x00\x05I"
+
+  def reader(chunk: Int) -> PG::MessageReader
+    source = WireChunks.new(STREAM, chunk)
+    PG::MessageReader.new(->(n: Int) { source.read(n) })
+  end
+
+  def test_whole_and_split_reads
+    [1, 2, 3, 7, 100].each do |chunk|
+      r = reader(chunk)
+      assert_equal[PG::Backend](PG::Backend::AuthenticationOk, r.read)
+      assert_equal[PG::Backend](PG::Backend::ParameterStatus.new("TimeZone", "Etc/UTC"), r.read)
+      assert_equal[PG::Backend](PG::Backend::ReadyForQuery.new("I"), r.read)
+      assert_raise(PG::ConnectionError) { r.read }
+    end
+  end
+
+  def test_end_in_the_middle
+    source = WireChunks.new(STREAM.slice(0, 7), 100)
+    r = PG::MessageReader.new(->(n: Int) { source.read(n) })
+    assert_raise_message(/closed the connection/) { r.read }
+  end
+
+  def test_bad_length
+    for bytes in [b"Z\x00\x00\x00\x03", b"D\x7f\xff\xff\xff"]
+      source = WireChunks.new(bytes, 100)
+      r = PG::MessageReader.new(->(n: Int) { source.read(n) })
+      assert_raise(PG::ProtocolError) { r.read }
+    end
+  end
+end

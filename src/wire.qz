@@ -1,0 +1,201 @@
+# The byte level of PostgreSQL's protocol (version 3): big-endian integers
+# and NUL-terminated strings, written into a `Bytes::Builder` and read
+# from `Bytes`.
+module Wire
+  # Appends `n` as a big-endian 16-bit integer (its two's complement when
+  # negative). Raises `ArgumentError` when `n` does not fit in 16 bits,
+  # signed or unsigned.
+  #
+  # ```
+  # PG::Wire.int16(Bytes::Builder.new, 258).to_bytes   # => b"\x01\x02"
+  # PG::Wire.int16(Bytes::Builder.new, -1).to_bytes    # => b"\xff\xff"
+  # ```
+  def self.int16(b: Bytes::Builder, n: Int) -> Bytes::Builder
+    raise ArgumentError.new("#{n} does not fit in 16 bits") if n < -0x8000 || n > 0xffff
+    b << ((n >> 8) & 0xff) << (n & 0xff)
+  end
+
+  # Appends `n` as a big-endian 32-bit integer (its two's complement when
+  # negative). Raises `ArgumentError` when `n` does not fit in 32 bits,
+  # signed or unsigned.
+  #
+  # ```
+  # PG::Wire.int32(Bytes::Builder.new, 196608).to_bytes   # => b"\x00\x03\x00\x00"
+  # ```
+  def self.int32(b: Bytes::Builder, n: Int) -> Bytes::Builder
+    raise ArgumentError.new("#{n} does not fit in 32 bits") if n < -0x8000_0000 || n > 0xffff_ffff
+    b << ((n >> 24) & 0xff) << ((n >> 16) & 0xff) << ((n >> 8) & 0xff) << (n & 0xff)
+  end
+
+  # Appends `s`'s UTF-8 bytes and a NUL. Raises `ArgumentError` when `s`
+  # holds a NUL itself, which would end it early.
+  #
+  # ```
+  # PG::Wire.cstring(Bytes::Builder.new, "user").to_bytes   # => b"user\x00"
+  # ```
+  def self.cstring(b: Bytes::Builder, s: String) -> Bytes::Builder
+    raise ArgumentError.new("a NUL inside #{s.inspect}") if s.include?("\0")
+    b << s << 0
+  end
+
+  # A message as the protocol frames it: a type byte (none for the
+  # startup and cancel messages, `type` nil), then the length of what
+  # follows counting itself, then `body`.
+  #
+  # ```
+  # PG::Wire.frame('S'.ord, Bytes.new)   # => b"S\x00\x00\x00\x04"
+  # ```
+  def self.frame(type: Int?, body: Bytes) -> Bytes
+    b = Bytes::Builder.new
+    b << type if type
+    int32(b, body.size + 4)
+    (b << body).to_bytes
+  end
+
+  # Reads big-endian integers, NUL-terminated strings and byte runs from
+  # `Bytes`, front to back. Reading past the end raises `PG::ProtocolError`.
+  class Reader
+    @data: Bytes
+    var @pos: Int = 0
+
+    # Reads `data` from its first byte.
+    def initialize(@data: Bytes); end
+
+    # The bytes not read yet.
+    def remaining -> Int = @data.size - @pos
+
+    # Whether everything was read.
+    def done? -> Bool = @pos == @data.size
+
+    # The next byte, 0 to 255.
+    def byte -> Int
+      need(1)
+      v = @data[@pos]
+      @pos += 1
+      v
+    end
+
+    # The next big-endian signed 16-bit integer.
+    #
+    # ```
+    # PG::Wire::Reader.new(b"\xff\xfe").int16   # => -2
+    # ```
+    def int16 -> Int
+      need(2)
+      v = (@data[@pos] << 8) | @data[@pos + 1]
+      @pos += 2
+      v >= 0x8000 ? v - 0x1_0000 : v
+    end
+
+    # The next big-endian signed 32-bit integer.
+    #
+    # ```
+    # PG::Wire::Reader.new(b"\x00\x00\x01\x00").int32   # => 256
+    # PG::Wire::Reader.new(b"\xff\xff\xff\xff").int32   # => -1
+    # ```
+    def int32 -> Int
+      need(4)
+      v = (@data[@pos] << 24) | (@data[@pos + 1] << 16) | (@data[@pos + 2] << 8) | @data[@pos + 3]
+      @pos += 4
+      v >= 0x8000_0000 ? v - 0x1_0000_0000 : v
+    end
+
+    # The next big-endian unsigned 16-bit integer (counts).
+    #
+    # ```
+    # PG::Wire::Reader.new(b"\xff\xfe").uint16   # => 65534
+    # ```
+    def uint16 -> Int
+      v = int16
+      v < 0 ? v + 0x1_0000 : v
+    end
+
+    # The next big-endian unsigned 32-bit integer (OIDs).
+    #
+    # ```
+    # PG::Wire::Reader.new(b"\x80\x00\x00\x01").uint32   # => 2147483649
+    # ```
+    def uint32 -> Int
+      v = int32
+      v < 0 ? v + 0x1_0000_0000 : v
+    end
+
+    # The next NUL-terminated string, without its NUL, decoded as UTF-8
+    # (an invalid sequence raises `PG::ProtocolError`).
+    #
+    # ```
+    # PG::Wire::Reader.new(b"ab\x00c\x00").cstring   # => "ab"
+    # ```
+    def cstring -> String
+      nul = @data.index(b"\0", @pos)
+      raise ProtocolError.new("a string without its NUL") unless nul
+      s = @data.slice(@pos, nul - @pos).decode?
+      raise ProtocolError.new("a string that is not UTF-8") unless s
+      @pos = nul + 1
+      s
+    end
+
+    # The next `n` bytes.
+    def bytes(n: Int) -> Bytes
+      raise ProtocolError.new("a negative length: #{n}") if n < 0
+      need(n)
+      v = @data.slice(@pos, n)
+      @pos += n
+      v
+    end
+
+    # The bytes not read yet, all of them.
+    def rest -> Bytes = bytes(remaining)
+
+    private def need(n: Int) -> Void
+      if remaining < n
+        raise ProtocolError.new("a message ends #{n - remaining} bytes early")
+      end
+    end
+  end
+end
+
+# Reads backend messages one at a time from a source of bytes: the
+# 5-byte header, then the body, never further.
+class MessageReader
+  # Messages longer than this are refused as a broken stream (the server
+  # sends rows of at most 1 GB, plus their framing).
+  MAX_LENGTH = 0x4000_0000 + 0x1000
+
+  @read: (Int) -> Bytes
+
+  # Reads from `io` (a socket).
+  def initialize(io: IO)
+    @read = ->(n: Int) { io.read_bytes(n) }
+  end
+
+  # Reads with `read`, which gives up to its argument's count of bytes
+  # and nothing at the end of the stream.
+  def initialize(@read: (Int) -> Bytes); end
+
+  # The next message. Raises `PG::ConnectionError` when the stream ends,
+  # and `PG::ProtocolError` for a message that does not parse.
+  def read -> Backend
+    header = Wire::Reader.new(exactly(5))
+    type = header.byte
+    length = header.int32
+    if length < 4 || length > MAX_LENGTH
+      raise ProtocolError.new("a #{type.chr.inspect} message of length #{length}")
+    end
+    Backend.decode(type, exactly(length - 4))
+  end
+
+  private def exactly(n: Int) -> Bytes
+    return Bytes.new if n == 0
+    first = @read.(n)
+    raise ConnectionError.new("the server closed the connection") if first.empty?
+    return first if first.size == n
+    b = Bytes::Builder.new << first
+    while b.size < n
+      more = @read.(n - b.size)
+      raise ConnectionError.new("the server closed the connection") if more.empty?
+      b << more
+    end
+    b.to_bytes
+  end
+end

@@ -1,0 +1,131 @@
+# The messages a client sends, encoded as the server reads them. Each
+# function returns the whole message, framed (`PG::Wire.frame`).
+module Frontend
+  # Protocol 3.0, as the startup message names it.
+  PROTOCOL = 196608
+
+  # The startup message: the protocol version and the parameters
+  # (`user` is required; `database`, `client_encoding`,
+  # `application_name`, ...), in the order given.
+  #
+  # ```
+  # PG::Frontend.startup({ "user" => "u" }).hex   # => "00000010000300007573657200750000"
+  # ```
+  def self.startup(params: Hash[String, String]) -> Bytes
+    b = Bytes::Builder.new
+    Wire.int32(b, PROTOCOL)
+    params.each do |k, v|
+      Wire.cstring(b, k)
+      Wire.cstring(b, v)
+    end
+    Wire.frame(nil, (b << 0).to_bytes)
+  end
+
+  # A password, in clear or as md5 auth hashes it (the protocol's PasswordMessage).
+  #
+  # ```
+  # PG::Frontend.password("pw")   # => b"p\x00\x00\x00\x07pw\x00"
+  # ```
+  def self.password(text: String) -> Bytes
+    Wire.frame('p'.ord, Wire.cstring(Bytes::Builder.new, text).to_bytes)
+  end
+
+  # The first SASL message: the mechanism chosen and its first data (nil:
+  # none).
+  def self.sasl_initial_response(mechanism: String, data: Bytes?) -> Bytes
+    b = Wire.cstring(Bytes::Builder.new, mechanism)
+    if data
+      Wire.int32(b, data.size)
+      b << data
+    else
+      Wire.int32(b, -1)
+    end
+    Wire.frame('p'.ord, b.to_bytes)
+  end
+
+  # A later SASL message.
+  def self.sasl_response(data: Bytes) -> Bytes = Wire.frame('p'.ord, data)
+
+  # A simple query: one or several statements, run at once.
+  #
+  # ```
+  # PG::Frontend.query("select 1")   # => b"Q\x00\x00\x00\rselect 1\x00"
+  # ```
+  def self.query(sql: String) -> Bytes
+    Wire.frame('Q'.ord, Wire.cstring(Bytes::Builder.new, sql).to_bytes)
+  end
+
+  # Parses `sql` into the prepared statement `name` (`""`: the unnamed
+  # one); `types` gives the OIDs of the first parameters (0, or none: the
+  # server infers them).
+  def self.parse(name: String, sql: String, types: Array[Int] = []) -> Bytes
+    b = Wire.cstring(Bytes::Builder.new, name)
+    Wire.cstring(b, sql)
+    Wire.int16(b, types.size)
+    types.each { |t| Wire.int32(b, t) }
+    Wire.frame('P'.ord, b.to_bytes)
+  end
+
+  # Binds `params` (each in text format, or nil for NULL) to the prepared
+  # statement `statement`, making the portal `portal`; the results come
+  # in text format.
+  def self.bind(portal: String, statement: String, params: Array[Bytes?]) -> Bytes
+    b = Wire.cstring(Bytes::Builder.new, portal)
+    Wire.cstring(b, statement)
+    Wire.int16(b, 0)
+    Wire.int16(b, params.size)
+    params.each do |p|
+      if p
+        Wire.int32(b, p.size)
+        b << p
+      else
+        Wire.int32(b, -1)
+      end
+    end
+    Wire.int16(b, 0)
+    Wire.frame('B'.ord, b.to_bytes)
+  end
+
+  # Asks for a prepared statement's parameter types and row shape.
+  def self.describe_statement(name: String) -> Bytes = describe('S'.ord, name)
+
+  # Asks for a portal's row shape.
+  def self.describe_portal(name: String) -> Bytes = describe('P'.ord, name)
+
+  # Runs the portal, returning at most `max_rows` rows (0: all of them).
+  # Raises `ArgumentError` when `max_rows` is negative or beyond 2^31 - 1.
+  def self.execute(portal: String, max_rows: Int = 0) -> Bytes
+    raise ArgumentError.new("max_rows out of range: #{max_rows}") if max_rows < 0 || max_rows > 0x7fff_ffff
+    b = Wire.cstring(Bytes::Builder.new, portal)
+    Wire.int32(b, max_rows)
+    Wire.frame('E'.ord, b.to_bytes)
+  end
+
+  # Closes a prepared statement.
+  def self.close_statement(name: String) -> Bytes = close('S'.ord, name)
+
+  # Closes a portal.
+  def self.close_portal(name: String) -> Bytes = close('P'.ord, name)
+
+  # Ends an extended query: the server answers ReadyForQuery, after an
+  # error too.
+  #
+  # ```
+  # PG::Frontend.sync   # => b"S\x00\x00\x00\x04"
+  # ```
+  def self.sync -> Bytes = Wire.frame('S'.ord, Bytes.new)
+
+  # Asks the server to send what it has buffered.
+  def self.flush -> Bytes = Wire.frame('H'.ord, Bytes.new)
+
+  # Ends the session.
+  def self.terminate -> Bytes = Wire.frame('X'.ord, Bytes.new)
+
+  private def self.describe(kind: Int, name: String) -> Bytes
+    Wire.frame('D'.ord, Wire.cstring(Bytes::Builder.new << kind, name).to_bytes)
+  end
+
+  private def self.close(kind: Int, name: String) -> Bytes
+    Wire.frame('C'.ord, Wire.cstring(Bytes::Builder.new << kind, name).to_bytes)
+  end
+end

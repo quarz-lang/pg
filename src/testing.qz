@@ -1,0 +1,159 @@
+# A PostgreSQL server for tests: the one PG_TEST_URL names, or else a
+# throwaway cluster this module makes with the server's own programs
+# (`initdb` and `pg_ctl` from /usr/lib/postgresql/*/bin), in a temporary
+# directory, on a random port of 127.0.0.1 and a private socket
+# directory, with SCRAM-SHA-256 for every connection, removed when it is
+# stopped. For tests only: it starts processes and writes files, and its
+# password comes from the default random generator, which a test's
+# `srand` makes predictable.
+#
+# ```quarz no_run
+# PG::Testing.with_cluster do |url|
+#   conn = PG.connect(url)
+#   conn.exec("CREATE TABLE t (id int)")
+# end
+# ```
+#
+# In a `Test::Case`, start one for the class and omit its tests when
+# there is none:
+#
+# ```quarz no_run
+# class UsersTest < Test::Case
+#   SERVER = Atom[PG::Testing::Server | String].new("not started")
+#
+#   def self.startup
+#     SERVER.set(PG::Testing.start_or_reason)
+#   end
+#
+#   def self.shutdown
+#     case SERVER.get
+#     in PG::Testing::Server => s then s.stop
+#     else nil
+#     end
+#   end
+#
+#   def url -> String
+#     case SERVER.get
+#     in PG::Testing::Server => s then s.url
+#     in String => why then omit(why)
+#     end
+#   end
+# end
+# ```
+module Testing
+  # Neither PG_TEST_URL nor the server's programs to make a cluster.
+  class Unavailable < Error
+  end
+
+  # A server to test against: PG_TEST_URL's, or a cluster of ours.
+  class Server
+    include Shareable
+
+    # A connection URL, with the password.
+    @url: String
+    # The cluster's directory (nil: PG_TEST_URL's server).
+    @dir: String?
+    @bin: String
+
+    # (Made by `PG::Testing.start`.)
+    def initialize(@url: String, @dir: String?, @bin: String); end
+
+    # A URL to connect to it, with its password.
+    def url -> String = @url
+
+    # Whether it is a cluster of ours (whose `pg_hba.conf` has the lines
+    # `start` was given), not PG_TEST_URL's server.
+    def ours? -> Bool = !@dir.nil?
+
+    # The directory of its unix socket, for a cluster of ours.
+    def socket_dir -> String? = @dir
+
+    # The password in the URL.
+    def password -> String = cog.parse_url(@url).password || ""
+
+    # The port in the URL.
+    def port -> Int = cog.parse_url(@url).port
+
+    # Stops a cluster of ours and removes its directory; nothing for
+    # PG_TEST_URL's.
+    def stop -> Void
+      dir = @dir
+      return unless dir
+      Process.run("#{@bin}/pg_ctl", "-D", "#{dir}/data", "-m", "immediate", "-w", "stop")
+      Process.run("rm", "-rf", dir)
+    end
+  end
+
+  # A server: PG_TEST_URL's when it is set, else a new cluster, whose
+  # superuser is `quarz` and whose `pg_hba.conf` starts with the lines
+  # `hba` gives (`"host all md5_user 127.0.0.1/32 md5"`), before
+  # SCRAM-SHA-256 for every connection (`hba` does nothing to
+  # PG_TEST_URL's server: check `Server#ours?` before relying on it).
+  # Raises `Unavailable` when there is neither.
+  def self.start(*, hba: Array[String] = []) -> Server
+    if (env = ENV["PG_TEST_URL"]?) && !env.empty?
+      return Server.new(env, nil, "")
+    end
+    initdb = Dir.glob("/usr/lib/postgresql/*/bin/initdb").sort.last
+    raise Unavailable.new("no PG_TEST_URL and no initdb to make a server") unless initdb
+    bin = File.dirname(initdb)
+    dir = "#{Dir.tmpdir}/quarz-pg-#{Process.pid}-#{Random.rand(1_000_000_000)}"
+    run("mkdir", "-m", "700", dir)
+    begin
+      password = Random.bytes(12).hex
+      File.write("#{dir}/password", password)
+      run("#{bin}/initdb", "-D", "#{dir}/data", "-U", "quarz", "--auth=scram-sha-256",
+          "--pwfile=#{dir}/password", "-E", "UTF8", "--locale=C")
+      # (The first matching line wins.)
+      lines = hba + ["local all all scram-sha-256", "host all all 127.0.0.1/32 scram-sha-256"]
+      File.write("#{dir}/data/pg_hba.conf", lines.join("\n") + "\n")
+      port = start_on_a_free_port(bin, dir)
+      Server.new("postgres://quarz:#{password}@127.0.0.1:#{port}/postgres", dir, bin)
+    rescue Exception => e
+      # (A start that timed out may have left the server running.)
+      if File.exist?("#{dir}/data/postmaster.pid")
+        Process.run("#{bin}/pg_ctl", "-D", "#{dir}/data", "-m", "immediate", "-w", "stop")
+      end
+      Process.run("rm", "-rf", dir)
+      raise e
+    end
+  end
+
+  # `start`, or why there is no server: for a test class's `startup`,
+  # whose tests then `omit` with the reason.
+  def self.start_or_reason(*, hba: Array[String] = []) -> Server | String
+    start(hba: hba)
+  rescue Unavailable => e
+    e.message
+  end
+
+  # Runs the block with the URL of a server (`start`), and stops it
+  # afterwards (`hba` as for `start`: nothing to PG_TEST_URL's server).
+  def self.with_cluster[R](*, hba: Array[String] = [], &: (String) -> R) -> R
+    server = start(hba: hba)
+    begin
+      yield server.url
+    ensure
+      server.stop
+    end
+  end
+
+  # (The settings go in `postgresql.auto.conf`, not pg_ctl's `-o`, which
+  # a shell splits: a directory with a space would not do.)
+  private def self.start_on_a_free_port(bin: String, dir: String) -> Int
+    5.times do
+      port = Random.rand(20000..60000)
+      conf = "unix_socket_directories = '#{dir.gsub("'", "''")}'\nlisten_addresses = '127.0.0.1'\nport = #{port}\n"
+      File.write("#{dir}/data/postgresql.auto.conf", conf)
+      out = Process.run("#{bin}/pg_ctl", "-D", "#{dir}/data", "-l", "#{dir}/log", "-w", "-t", "60", "start")
+      return port if out.success?
+    end
+    log = File.exist?("#{dir}/log") ? File.read("#{dir}/log").lines.last(10).join : ""
+    raise Error.new("the throwaway server did not start; its log ended with:\n#{log}")
+  end
+
+  private def self.run(*command: String) -> Void
+    out = Process.run(*command)
+    raise Error.new("#{command.first} failed: #{out.stderr}") unless out.success?
+  end
+end

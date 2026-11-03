@@ -1,26 +1,25 @@
 require "test"
-require_relative "server"
 
-# Against a real server (test/server.qz): queries, results, errors,
+# Against a real server (PG::Testing): queries, results, errors,
 # transactions, and the authentication methods that need roles of their
 # own.
 class QueryTest < Test::Case
-  SERVER = Atom[TestServer | String].new("not started")
+  SERVER = Atom[PG::Testing::Server | String].new("not started")
 
   def self.startup
-    SERVER.set(TestServer.start)
+    SERVER.set(PG::Testing.start_or_reason(hba: ["host all md5_user 127.0.0.1/32 md5", "host all clear_user 127.0.0.1/32 password"]))
   end
 
   def self.shutdown
     case SERVER.get
-    in TestServer => s then s.stop
+    in PG::Testing::Server => s then s.stop
     else nil
     end
   end
 
-  def server -> TestServer
+  def server -> PG::Testing::Server
     case SERVER.get
-    in TestServer => s then s
+    in PG::Testing::Server => s then s
     in String => why then omit(why)
     end
   end

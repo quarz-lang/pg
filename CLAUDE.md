@@ -21,7 +21,7 @@ quarz doc --check
 ```
 
 Use a `quarz` built from Quarz's main (`cargo build --release` there).
-The integration tests (test/server.qz) use `PG_TEST_URL` when it is set
+The integration tests (`PG::Testing`, src/testing.qz) use `PG_TEST_URL` when it is set
 (CI's `postgres:16` service sets it), else a throwaway cluster made with
 `/usr/lib/postgresql/*/bin/initdb` and `pg_ctl` (random port, temporary
 directory, removed in the test class's shutdown); with neither they are

@@ -1,27 +1,18 @@
-# The connection to the server failed or was closed: it cannot be used
-# any further.
-class ConnectionError < StandardError
-end
-
-# The server sent bytes that are not the protocol: the connection cannot
-# be used any further.
-class ProtocolError < ConnectionError
-end
-
-# The server refused the credentials, or asked for a method this client
-# does not speak, or its side of the exchange did not check out.
-class AuthenticationError < ConnectionError
+# The root of every error this cog raises: `rescue PG::Error` catches
+# them all. (An argument a method cannot take is an `ArgumentError`, as
+# anywhere.)
+class Error < StandardError
 end
 
 # An error the server reported (an ErrorResponse message): a failed statement,
 # or a refused login. Its fields are the protocol's, by their one-letter
 # codes; the common ones have readers.
-class Error < StandardError
+class ServerError < Error
   @fields: Hash[String, String]
 
   # An error with the server's `fields`.
   def initialize(@fields: Hash[String, String])
-    super(Error.describe(fields))
+    super(ServerError.describe(fields))
   end
 
   # All the fields, by their codes (`S` severity, `C` SQLSTATE, `M`
@@ -51,10 +42,34 @@ class Error < StandardError
   # its own.
   #
   # ```
-  # PG::Error.describe({ "V" => "ERROR", "C" => "42P01", "M" => "no table" })   # => "ERROR 42P01: no table"
+  # PG::ServerError.describe({ "V" => "ERROR", "C" => "42P01", "M" => "no table" })   # => "ERROR 42P01: no table"
   # ```
   def self.describe(fields: Hash[String, String]) -> String
     s = "#{fields["V"]? || fields["S"]? || "ERROR"} #{fields["C"]? || "?????"}: #{fields["M"]? || "(no message)"}"
     (d = fields["D"]?) ? "#{s}\nDETAIL: #{d}" : s
   end
+end
+
+# The connection to the server failed or was closed: it cannot be used
+# any further.
+class ConnectionError < Error
+end
+
+# The server sent bytes that are not the protocol: the connection cannot
+# be used any further.
+class ProtocolError < ConnectionError
+end
+
+# The client cannot authenticate as the server asks, or the server's side
+# of the exchange did not check out. (A server that refuses the
+# credentials reports a `PG::ServerError`, SQLSTATE 28P01.)
+class AuthenticationError < ConnectionError
+end
+
+# A typed reader of a row found NULL (use its `?` form to get nil).
+class NullError < Error
+end
+
+# `PG::Connection#transaction` was called inside a transaction.
+class TransactionError < Error
 end

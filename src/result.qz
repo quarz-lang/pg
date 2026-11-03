@@ -1,0 +1,253 @@
+# What a statement returned: its columns and rows (none for a statement
+# that returns no rows), and its command tag.
+class Result
+  @columns: Array[Field]
+  @rows: Array[Row]
+  @command_tag: String
+
+  # A result of `rows` with `columns`, as the server tagged it.
+  def initialize(@columns: Array[Field], @rows: Array[Row], @command_tag: String); end
+
+  # The columns, in order.
+  def columns -> Array[Field] = @columns
+
+  # The columns' names, in order.
+  def column_names -> Array[String] = @columns.map(&:name)
+
+  # The rows.
+  def rows -> Array[Row] = @rows
+
+  # The command tag (`SELECT 2`, `INSERT 0 1`, `UPDATE 3`, `CREATE TABLE`),
+  # or `""` for an empty query.
+  def command_tag -> String = @command_tag
+
+  # How many rows the statement inserted, updated, deleted, selected,
+  # moved, fetched, copied or merged, from its tag; nil for a statement
+  # that does not count rows.
+  #
+  # ```
+  # PG::Result.new([], [], "INSERT 0 3").affected   # => 3
+  # PG::Result.new([], [], "CREATE TABLE").affected  # => nil
+  # ```
+  def affected -> Int?
+    m = @command_tag.match(/\A(?:INSERT \d+|UPDATE|DELETE|SELECT|MOVE|FETCH|COPY|MERGE) (\d+)\z/)
+    m && m[1]&.to_i
+  end
+
+  # The number of rows.
+  def size -> Int = @rows.size
+
+  # Whether there are no rows.
+  def empty? -> Bool = @rows.empty?
+
+  # Each row.
+  def each(&: (Row) -> Void) -> Void = @rows.each { |r| yield r }
+
+  # The first row, or nil.
+  def first? -> Row? = @rows.first?
+
+  # The rows as hashes from column names to text values.
+  def to_a -> Array[Hash[String, String?]] = @rows.map(&:to_h)
+end
+
+# A row of a result: each column's value as the server's text, and typed
+# readers on top. A column is named by its index from 0 or by its name
+# (the first column of that name).
+#
+# The readers decode PostgreSQL's text format: `int` for int2/int4/int8
+# (and any integer text), `float` for float4/float8/numeric
+# (NaN, Infinity), `bool` for `t`/`f`, `bytes` for bytea's hex form,
+# `time` for timestamp, timestamptz and date (a timestamp without zone,
+# and a date at midnight, are taken as UTC), `string` for anything. Each
+# raises `PG::NullError` on NULL; its `?` form gives nil instead. A value
+# a reader cannot decode raises `ArgumentError`.
+class Row
+  @columns: Array[Field]
+  @values: Array[Bytes?]
+
+  # A row of `values`, one per column of `columns`.
+  def initialize(@columns: Array[Field], @values: Array[Bytes?]); end
+
+  # The columns.
+  def columns -> Array[Field] = @columns
+
+  # The number of columns.
+  def size -> Int = @values.size
+
+  # The column's text, or nil for NULL. Raises `IndexError` for a column
+  # the row does not have.
+  def [](column: Int | String) -> String?
+    raw(column)&.decode
+  end
+
+  # The column's value as an Int.
+  def int(column: Int | String) -> Int = int?(column) || null(column)
+
+  # As `#int`, nil for NULL.
+  def int?(column: Int | String) -> Int?
+    (t = text(column)) ? Row.parse_int(t) : nil
+  end
+
+  # The column's value as a Float.
+  def float(column: Int | String) -> Float = float?(column) || null(column)
+
+  # As `#float`, nil for NULL.
+  def float?(column: Int | String) -> Float?
+    (t = text(column)) ? Row.parse_float(t) : nil
+  end
+
+  # The column's value as text.
+  def string(column: Int | String) -> String = string?(column) || null(column)
+
+  # As `#string`, nil for NULL.
+  def string?(column: Int | String) -> String? = self[column]
+
+  # The column's value as a Bool.
+  def bool(column: Int | String) -> Bool
+    v = bool?(column)
+    v.nil? ? null(column) : v
+  end
+
+  # As `#bool`, nil for NULL.
+  def bool?(column: Int | String) -> Bool?
+    case text(column)
+    in nil then nil
+    in "t" then true
+    in "f" then false
+    in String => t then raise ArgumentError.new("not a bool: #{t.inspect}")
+    end
+  end
+
+  # The column's value as Bytes: bytea's hex form decoded, or the text's
+  # bytes for another type.
+  def bytes(column: Int | String) -> Bytes = bytes?(column) || null(column)
+
+  # As `#bytes`, nil for NULL.
+  def bytes?(column: Int | String) -> Bytes?
+    v = raw(column)
+    return nil unless v
+    type_of(column) == Types::BYTEA ? Row.parse_bytea(v) : v
+  end
+
+  # The column's value as a Time.
+  def time(column: Int | String) -> Time = time?(column) || null(column)
+
+  # As `#time`, nil for NULL.
+  def time?(column: Int | String) -> Time?
+    (t = text(column)) ? Row.parse_time(t) : nil
+  end
+
+  # The row as a hash from column names to text values.
+  def to_h -> Hash[String, String?]
+    h: Hash[String, String?] = {}
+    @columns.each_with_index { |c, i| h = h.put(c.name, @values[i]&.decode) }
+    h
+  end
+
+  def inspect -> String = "#<PG::Row #{to_h.inspect}>"
+
+  def to_s -> String = inspect
+
+  # Text as an Int (`-42`).
+  def self.parse_int(text: String) -> Int
+    raise ArgumentError.new("not an integer: #{text.inspect}") unless text.match?(/\A-?[0-9]+\z/)
+    text.to_i
+  rescue OverflowError
+    raise ArgumentError.new("an integer beyond Int: #{text}")
+  end
+
+  # Text as a Float, with PostgreSQL's spellings of the special values.
+  def self.parse_float(text: String) -> Float
+    case text
+    when "NaN" then Float::NAN
+    when "Infinity" then Float::INFINITY
+    when "-Infinity" then -Float::INFINITY
+    else
+      raise ArgumentError.new("not a number: #{text.inspect}") unless text.match?(/\A-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?\z/)
+      text.to_f
+    end
+  end
+
+  # bytea's hex output (`\x0aff`) as Bytes.
+  #
+  # ```
+  # PG::Row.parse_bytea(b"\\x0aff")   # => b"\n\xff"
+  # ```
+  def self.parse_bytea(raw: Bytes) -> Bytes
+    unless raw.start_with?(b"\\x")
+      raise ArgumentError.new("bytea not in hex form (set bytea_output = 'hex')")
+    end
+    hex = raw.slice(2, raw.size - 2).decode
+    raise ArgumentError.new("malformed bytea") unless hex.match?(/\A(?:[0-9a-fA-F]{2})*\z/)
+    Bytes.from_hex(hex)
+  end
+
+  # A timestamp, timestamptz or date in PostgreSQL's ISO output
+  # (`2024-03-05 14:07:09.5+09`, `2024-03-05`): a value without an offset
+  # is UTC.
+  #
+  # ```
+  # PG::Row.parse_time("2024-03-05 14:07:09+09").utc_offset   # => 32400
+  # PG::Row.parse_time("2024-03-05")                          # => 2024-03-05 00:00:00 UTC
+  # ```
+  def self.parse_time(text: String) -> Time
+    m = text.match(/\A(\d{4,}-\d\d-\d\d)(?: (\d\d:\d\d:\d\d(?:\.\d+)?)([-+]\d\d(?::?\d\d){0,2})?)?\z/)
+    if text == "infinity" || text == "-infinity"
+      raise ArgumentError.new("#{text}: a Time cannot hold it (read the column as a string)")
+    end
+    raise ArgumentError.new("not a timestamp: #{text.inspect}") unless m
+    date = m[1] || ""
+    clock = m[2] || "00:00:00"
+    offset = m[3]
+    zone = if offset
+             sign = offset[0]
+             parts = offset[1, offset.size - 1].delete(":")
+             parts = parts + "00" if parts.size == 2
+             raise ArgumentError.new("an offset with seconds: #{text.inspect}") if parts.size > 4
+             "#{sign}#{parts[0, 2]}:#{parts[2, 2]}"
+           else
+             "Z"
+           end
+    Time.parse("#{date}T#{clock}#{zone}")
+  end
+
+  private def index(column: Int | String) -> Int
+    case column
+    in Int => i
+      raise IndexError.new("no column #{i}: the row has #{@values.size}") unless i >= 0 && i < @values.size
+      i
+    in String => name
+      @columns.index { |c| c.name == name } || raise(IndexError.new("no column #{name.inspect}"))
+    end
+  end
+
+  private def raw(column: Int | String) -> Bytes? = @values[index(column)]
+
+  private def text(column: Int | String) -> String? = raw(column)&.decode
+
+  private def type_of(column: Int | String) -> Int = @columns[index(column)].type
+
+  private def null(column: Int | String) -> Nothing
+    raise NullError.new("column #{column.inspect} is NULL")
+  end
+end
+
+# OIDs of the built-in types the readers know.
+module Types
+  BOOL = 16
+  BYTEA = 17
+  INT8 = 20
+  INT2 = 21
+  INT4 = 23
+  TEXT = 25
+  FLOAT4 = 700
+  FLOAT8 = 701
+  VARCHAR = 1043
+  DATE = 1082
+  TIMESTAMP = 1114
+  TIMESTAMPTZ = 1184
+  NUMERIC = 1700
+  UUID = 2950
+  JSON = 114
+  JSONB = 3802
+end

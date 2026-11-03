@@ -30,8 +30,10 @@ jobs:
       # SCRAM-SHA-256: the image's default for a role with a password.
       PG_TEST_URL: postgres://postgres:quarz-ci@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/checkout@v7
+      - name: Check out this cog
+        uses: actions/checkout@v7
+      - name: Check out Quarz (main), to build it
+        uses: actions/checkout@v7
         with:
           repository: quarz-lang/quarz
           path: .quarz

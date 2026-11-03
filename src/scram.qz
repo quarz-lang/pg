@@ -1,0 +1,99 @@
+# The client side of SCRAM-SHA-256 (RFC 5802, RFC 7677), as PostgreSQL
+# runs it: without channel binding (`n,,`), and with the user name left
+# empty, since the server takes the startup message's.
+#
+# ```
+# s = PG::Scram.new("pencil", nonce: "rOprNGfwEbeRWgbNEkqO", user: "user")
+# s.client_first   # => "n,,n=user,r=rOprNGfwEbeRWgbNEkqO"
+# ```
+#
+# The password is used as it is: SASLprep, which PostgreSQL applies when
+# the password is valid for it, changes only passwords with characters
+# beyond ASCII that it maps or forbids, so such a password may be refused.
+class Scram
+  # The mechanism's name, as the server lists it.
+  MECHANISM = "SCRAM-SHA-256"
+
+  @password: String
+  @nonce: String
+  @user: String
+  var @auth_message: String? = nil
+  var @server_signature: Bytes? = nil
+  var @verified: Bool = false
+
+  # A new exchange for `password`, with a random 18-byte nonce unless one
+  # is given (tests).
+  def initialize(@password: String, nonce: String? = nil, user: String = "")
+    @nonce = nonce || Base64.encode(Random.bytes(18))
+    @user = user.gsub("=", "=3D").gsub(",", "=2C")
+  end
+
+  # The first message: the GS2 header and the bare part.
+  def client_first -> String = "n,,#{first_bare}"
+
+  # The final message, answering the server's first message. Raises
+  # `PG::AuthenticationError` when that message is malformed or its nonce
+  # does not extend this client's.
+  def client_final(server_first: String) -> String
+    attrs = attributes(server_first)
+    nonce = attrs["r"]? || fail("no nonce")
+    salt = attrs["s"]? || fail("no salt")
+    count = attrs["i"]? || fail("no iteration count")
+    fail("an iteration count of #{count.inspect}") unless count.match?(/\A[1-9][0-9]{0,8}\z/)
+    rounds = count.to_i
+    fail("a nonce that does not extend the client's") unless nonce.start_with?(@nonce) && nonce.size > @nonce.size
+    salted = Digest::PBKDF2.sha256(@password, decode(salt), rounds, 32)
+    client_key = Digest::HMAC.sha256(salted, "Client Key")
+    stored_key = Digest::SHA256.digest(client_key)
+    without_proof = "c=biws,r=#{nonce}"
+    auth = "#{first_bare},#{server_first},#{without_proof}"
+    signature = Digest::HMAC.sha256(stored_key, auth)
+    proof = Bytes.from(client_key.to_a.zip(signature.to_a).map { |a, b| a ^ b })
+    @auth_message = auth
+    @server_signature = Digest::HMAC.sha256(Digest::HMAC.sha256(salted, "Server Key"), auth)
+    "#{without_proof},p=#{Base64.encode(proof)}"
+  end
+
+  # Checks the server's final message, which proves that the server knows
+  # the password too. Raises `PG::AuthenticationError` when it does not,
+  # or reports an error (`e=`).
+  def verify(server_final: String) -> Void
+    expected = @server_signature || fail("the final message before the client's")
+    attrs = attributes(server_final)
+    if (e = attrs["e"]?)
+      fail("the server refused: #{e}")
+    end
+    v = attrs["v"]? || fail("no server signature")
+    fail("the server's signature does not match") unless decode(v) == expected
+    @verified = true
+  end
+
+  # Whether `#verify` checked the server's signature: until then the
+  # server has not proved that it knows the password.
+  def verified? -> Bool = @verified
+
+  private def first_bare -> String = "n=#{@user},r=#{@nonce}"
+
+  private def attributes(message: String) -> Hash[String, String]
+    attrs: Hash[String, String] = {}
+    message.split(",").each do |part|
+      key, eq, value = part.partition("=")
+      fail("a malformed attribute #{part.inspect}") if key.size != 1 || eq.empty?
+      fail("the attribute #{key} twice") if attrs.has_key?(key)
+      attrs = attrs.put(key, value)
+    end
+    # RFC 5802 §5.1: an extension the client must understand.
+    fail("a mandatory extension (m=)") if attrs.has_key?("m")
+    attrs
+  end
+
+  private def decode(text: String) -> Bytes
+    Base64.decode(text)
+  rescue ArgumentError
+    fail("malformed base64 #{text.inspect}")
+  end
+
+  private def fail(message: String) -> Nothing
+    raise AuthenticationError.new("SCRAM: #{message}")
+  end
+end

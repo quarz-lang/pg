@@ -7,3 +7,54 @@ end
 # be used any further.
 class ProtocolError < ConnectionError
 end
+
+# The server refused the credentials, or asked for a method this client
+# does not speak, or its side of the exchange did not check out.
+class AuthenticationError < ConnectionError
+end
+
+# An error the server reported (an ErrorResponse message): a failed statement,
+# or a refused login. Its fields are the protocol's, by their one-letter
+# codes; the common ones have readers.
+class Error < StandardError
+  @fields: Hash[String, String]
+
+  # An error with the server's `fields`.
+  def initialize(@fields: Hash[String, String])
+    super(Error.describe(fields))
+  end
+
+  # All the fields, by their codes (`S` severity, `C` SQLSTATE, `M`
+  # message, `D` detail, `H` hint, `P` position, `W` where, `s` schema,
+  # `t` table, `c` column, `n` constraint, ...).
+  def fields -> Hash[String, String] = @fields
+
+  # The SQLSTATE code (`23505` for a unique violation).
+  def code -> String = @fields["C"]? || ""
+
+  # ERROR, FATAL or PANIC (not localized).
+  def severity -> String = @fields["V"]? || @fields["S"]? || ""
+
+  # The detail, if the server gave one.
+  def detail -> String? = @fields["D"]?
+
+  # The hint, if the server gave one.
+  def hint -> String? = @fields["H"]?
+
+  # Where in the statement the error is: a character position from 1.
+  def position -> Int? = @fields["P"]?&.to_i
+
+  # The constraint violated, if any.
+  def constraint -> String? = @fields["n"]?
+
+  # `ERROR 23505: duplicate key value ...`, with the detail on a line of
+  # its own.
+  #
+  # ```
+  # PG::Error.describe({ "V" => "ERROR", "C" => "42P01", "M" => "no table" })   # => "ERROR 42P01: no table"
+  # ```
+  def self.describe(fields: Hash[String, String]) -> String
+    s = "#{fields["V"]? || fields["S"]? || "ERROR"} #{fields["C"]? || "?????"}: #{fields["M"]? || "(no message)"}"
+    (d = fields["D"]?) ? "#{s}\nDETAIL: #{d}" : s
+  end
+end

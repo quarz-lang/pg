@@ -1,0 +1,74 @@
+# The PostgreSQL server the integration tests run against: PG_TEST_URL's
+# when it is set (CI's postgres:16 service), or else a throwaway cluster
+# made with the server's own programs (initdb, pg_ctl) in a temporary
+# directory, on a random port of 127.0.0.1 and a private socket
+# directory, with SCRAM-SHA-256 for every connection. Without either, the
+# integration tests are omitted.
+class TestServer
+  include Shareable
+
+  # A connection URL with the password.
+  @url: String
+  # The cluster's directory (nil: PG_TEST_URL's server, not ours).
+  @dir: String?
+  @bin: String
+
+  def initialize(@url: String, @dir: String?, @bin: String); end
+
+  def url -> String = @url
+
+  # The socket directory of a cluster of ours (nil otherwise).
+  def socket_dir -> String? = @dir
+
+  # The password in the URL.
+  def password -> String = PG.parse_url(@url).password || ""
+
+  # The port in the URL.
+  def port -> Int = PG.parse_url(@url).port
+
+  # The server, or why there is none.
+  def self.start -> TestServer | String
+    if (env = ENV["PG_TEST_URL"]?) && !env.empty?
+      return TestServer.new(env, nil, "")
+    end
+    bin = Dir.glob("/usr/lib/postgresql/*/bin/initdb").sort.last
+    return "no PG_TEST_URL and no initdb to make a server" unless bin
+    bin = File.dirname(bin)
+    dir = "#{Dir.tmpdir}/quarz-pg-#{Process.pid}-#{Random.rand(1_000_000_000)}"
+    run("mkdir", "-m", "700", dir)
+    begin
+      password = Random.bytes(12).hex
+      File.write("#{dir}/password", password)
+      run("#{bin}/initdb", "-D", "#{dir}/data", "-U", "quarz", "--auth=scram-sha-256",
+          "--pwfile=#{dir}/password", "-E", "UTF8", "--locale=C")
+      port = start_on_a_free_port(bin, dir)
+      TestServer.new("postgres://quarz:#{password}@127.0.0.1:#{port}/postgres", dir, bin)
+    rescue Exception => e
+      Process.run("rm", "-rf", dir)
+      raise e
+    end
+  end
+
+  # Stops a cluster of ours and removes its directory.
+  def stop -> Void
+    dir = @dir
+    return unless dir
+    Process.run("#{@bin}/pg_ctl", "-D", "#{dir}/data", "-m", "immediate", "-w", "stop")
+    Process.run("rm", "-rf", dir)
+  end
+
+  private def self.start_on_a_free_port(bin: String, dir: String) -> Int
+    5.times do
+      port = Random.rand(20000..60000)
+      out = Process.run("#{bin}/pg_ctl", "-D", "#{dir}/data", "-l", "#{dir}/log", "-w", "-t", "60",
+                        "-o", "-k #{dir} -c listen_addresses=127.0.0.1 -p #{port}", "start")
+      return port if out.success?
+    end
+    raise "the throwaway server did not start: see #{dir}/log"
+  end
+
+  private def self.run(*command: String) -> Void
+    out = Process.run(*command)
+    raise "#{command.first} failed: #{out.stderr}" unless out.success?
+  end
+end

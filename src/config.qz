@@ -1,0 +1,114 @@
+# Where and how to connect: what a URL or `PG.connect`'s keywords say.
+data Config = (
+  # A host name or address, or a directory holding the server's unix
+  # socket (a path starting with `/`).
+  host: String,
+  port: Int,
+  user: String,
+  password: String?,
+  # nil: the user's name, as the server takes it.
+  database: String?,
+  application_name: String?,
+  # Whether a password may be sent in clear over TCP (always over a unix
+  # socket).
+  allow_cleartext: Bool,
+  # How long connecting and authenticating may take (nil: no limit).
+  connect_timeout: Duration?
+)
+
+# Reads a connection URL, as libpq does:
+# `postgres://user:password@host:port/database?param=value`
+# (`postgresql://` too). The parts are percent-decoded; `host` may be a
+# socket directory (`%2Fvar%2Frun%2Fpostgresql`, or `?host=/var/run/...`);
+# the parameters `host`, `port`, `user`, `password`, `dbname`,
+# `application_name`, `connect_timeout` (seconds) and `sslmode` are
+# read. `sslmode` may be `disable`, `allow` or `prefer` (this client has
+# no TLS yet, so they all mean a plain connection); anything stronger
+# raises `ArgumentError`, as does a malformed URL.
+#
+# ```
+# c = PG.parse_url("postgres://ann:s%40cret@db.example:6543/shop?application_name=web")
+# [c.host, c.port, c.user, c.password, c.database, c.application_name]
+# # => ["db.example", 6543, "ann", "s@cret", "shop", "web"]
+# PG.parse_url("postgres://ann@%2Ftmp/shop").host   # => "/tmp"
+# PG.parse_url("postgres://h/d?sslmode=require")    # raises ArgumentError
+# ```
+public def parse_url(url: String) -> Config
+  m = url.match(/\Apostgres(?:ql)?:\/\/(?:([^@\/?#]*)@)?(\[[^\]\/]*\]|[^:\/?#]*)(?::([0-9]*))?(?:\/([^?#]*))?(?:\?([^#]*))?\z/)
+  # The message leaves out what may be a password.
+  raise ArgumentError.new("not a postgres:// URL: #{url.sub(/\/\/[^\/]*@/, "//***@").inspect}") unless m
+  user: String? = nil
+  password: String? = nil
+  if (info = m[1])
+    name, colon, secret = info.partition(":")
+    user = Config.unescape(name)
+    password = Config.unescape(secret) unless colon.empty?
+  end
+  host = m[2] || ""
+  host = host[1, host.size - 2] if host.start_with?("[")
+  host = Config.unescape(host)
+  port = (m[3] || "").empty? ? 5432 : Config.port(m[3] || "")
+  database = (m[4] || "").empty? ? nil : Config.unescape(m[4] || "")
+  application_name: String? = nil
+  connect_timeout: Duration? = nil
+  (m[5] || "").split("&").each do |pair|
+    next if pair.empty?
+    key, _, value = pair.partition("=")
+    value = Config.unescape(value)
+    case Config.unescape(key)
+    when "host" then host = value
+    when "port" then port = Config.port(value)
+    when "user" then user = value
+    when "password" then password = value
+    when "dbname" then database = value
+    when "application_name" then application_name = value
+    when "connect_timeout"
+      raise ArgumentError.new("connect_timeout: #{value.inspect}") unless value.match?(/\A[0-9]{1,9}\z/)
+      connect_timeout = value.to_i == 0 ? nil : value.to_i.seconds
+    when "sslmode"
+      unless ["disable", "allow", "prefer"].include?(value)
+        raise ArgumentError.new("sslmode=#{value}: this client has no TLS yet")
+      end
+    else
+      raise ArgumentError.new("unknown connection parameter #{key.inspect}")
+    end
+  end
+  Config.new(host: host.empty? ? "localhost" : host, port: port,
+             user: user || Config.default_user, password: password, database: database,
+             application_name: application_name, allow_cleartext: false,
+             connect_timeout: connect_timeout)
+end
+
+extension Config
+  # The user's name from the environment (PGUSER, then USER), as
+  # libpq takes it when a URL names none.
+  def self.default_user -> String = ENV["PGUSER"]? || ENV["USER"]? || "postgres"
+
+  # `text` with its `%XX` escapes decoded. Raises `ArgumentError` on a
+  # malformed escape or bytes that are not UTF-8.
+  def self.unescape(text: String) -> String
+    return text unless text.include?("%")
+    b = Bytes::Builder.new
+    bytes = text.to_bytes
+    i = 0
+    while i < bytes.size
+      if bytes[i] == 37
+        hex = i + 2 < bytes.size ? bytes.slice(i + 1, 2).decode : ""
+        # Not quoting `text`, which may be a password.
+        raise ArgumentError.new("a malformed %-escape in a connection URL") unless hex.match?(/\A[0-9A-Fa-f]{2}\z/)
+        b << hex.to_i(16)
+        i += 3
+      else
+        b << bytes[i]
+        i += 1
+      end
+    end
+    b.to_bytes.decode? || raise(ArgumentError.new("a %-escape that is not UTF-8 in a connection URL"))
+  end
+
+  # A port number, 1 to 65535.
+  def self.port(text: String) -> Int
+    raise ArgumentError.new("port: #{text.inspect}") unless text.match?(/\A[0-9]{1,5}\z/) && (1..65535).include?(text.to_i)
+    text.to_i
+  end
+end

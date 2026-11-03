@@ -11,6 +11,11 @@
 # cache.take_closes       # => ["qz2"]
 # ```
 class StatementCache
+  # The cache's state as an immutable value, to move it to another task
+  # with its connection (`PG::Lease`).
+  data Snapshot = (capacity: Int, names: Hash[String, String], order: Array[String], counter: Int,
+                   to_close: Array[String])
+
   @capacity: Int
   var @names: Hash[String, String] = {}
   # The SQL texts, least recently used first.
@@ -21,6 +26,18 @@ class StatementCache
   # A cache of at most `capacity` statements (0: none, every query is
   # parsed afresh as the unnamed statement).
   def initialize(@capacity: Int); end
+
+  # A cache in the state `snapshot` recorded.
+  def initialize(snapshot: Snapshot)
+    @capacity = snapshot.capacity
+    @names = snapshot.names
+    @order = snapshot.order
+    @counter = snapshot.counter
+    @to_close = snapshot.to_close
+  end
+
+  # The cache's state (the collections are immutable: nothing is copied).
+  def snapshot -> Snapshot = Snapshot.new(@capacity, @names, @order, @counter, @to_close)
 
   # Whether the cache keeps statements at all.
   def enabled? -> Bool = @capacity > 0

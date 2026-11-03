@@ -1,6 +1,8 @@
 # What a statement returned: its columns and rows (none for a statement
 # that returns no rows), and its command tag.
 class Result
+  include Shareable
+
   @columns: Array[Field]
   @rows: Array[Row]
   @command_tag: String
@@ -62,6 +64,8 @@ end
 # raises `PG::NullError` on NULL; its `?` form gives nil instead. A value
 # a reader cannot decode raises `ArgumentError`.
 class Row
+  include Shareable
+
   @columns: Array[Field]
   @values: Array[Bytes?]
 

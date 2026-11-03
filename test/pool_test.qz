@@ -1,0 +1,250 @@
+require "test"
+require_relative "server"
+
+# PG::Pool against a real server (test/server.qz).
+class PoolTest < Test::Case
+  SERVER = Atom[TestServer | String].new("not started")
+
+  def self.startup
+    SERVER.set(TestServer.start)
+  end
+
+  def self.shutdown
+    case SERVER.get
+    in TestServer => s then s.stop
+    else nil
+    end
+  end
+
+  def url -> String
+    case SERVER.get
+    in TestServer => s then s.url
+    in String => why then omit(why)
+    end
+  end
+
+  def test_many_tasks_share_few_connections
+    sums = PG::Pool.open(url, size: 3) do |pool: PG::Pool|
+      Task.scope do |s|
+        tasks = (1..8).map { |i: Int| s.spawn { pool.query("SELECT $1::int * 2", [i]).rows[0].int(0) } }
+        tasks.map(&:await)
+      end
+    end
+    assert_equal([2, 4, 6, 8, 10, 12, 14, 16], sums)
+  end
+
+  def test_connections_are_reused
+    PG::Pool.open(url, size: 2) do |pool: PG::Pool|
+      pids = Task.scope do |s|
+        (1..6).map { |_| s.spawn { pool.with { |c| c.process_id } } }.map(&:await)
+      end
+      assert_true(pids.uniq.size <= 2)
+      assert_true(pool.size <= 2)
+      nil
+    end
+  end
+
+  def test_a_lease_keeps_its_prepared_statements
+    PG::Pool.open(url, size: 1) do |pool|
+      pool.query("SELECT $1::int", [1])
+      assert_equal(1, pool.with { |c| c.prepared_statements })
+      pool.query("SELECT $1::int", [2])
+      assert_equal(1, pool.with { |c| c.exec("SELECT count(*) FROM pg_prepared_statements").rows[0].int(0) })
+      nil
+    end
+  end
+
+  def test_ordinary_blocks_and_errors
+    PG::Pool.open(url, size: 1) do |pool|
+      seen: Array[Int] = []
+      pool.with { |c| seen = seen.push(c.query("SELECT 7").rows[0].int(0)) }
+      assert_equal([7], seen)
+      assert_raise_message(/from the work/) { pool.with { |_| raise "from the work" } }
+      e = assert_raise(PG::ServerError) { pool.exec("SELECT * FROM no_such_table") }.as(PG::ServerError)
+      assert_equal("42P01", e.code)
+      assert_equal(1, pool.query("SELECT 1").rows[0].int(0))
+      assert_equal(1, pool.size)
+      nil
+    end
+  end
+
+  def test_transaction_and_leftover_transaction
+    PG::Pool.open(url, size: 1) do |pool|
+      pool.exec("CREATE TABLE IF NOT EXISTS pool_t (n int)")
+      pool.exec("TRUNCATE pool_t")
+      pool.transaction { |c| c.query("INSERT INTO pool_t VALUES ($1)", [1]) }
+      assert_raise(RuntimeError) do
+        pool.transaction { |c| c.query("INSERT INTO pool_t VALUES ($1)", [2]); raise "no" }
+      end
+      # Work that leaves a transaction open: rolled back when given back.
+      pool.with { |c| c.exec("BEGIN"); c.exec("INSERT INTO pool_t VALUES (3)") }
+      assert_equal(:idle, pool.with { |c| c.transaction_status })
+      assert_equal([1], pool.exec("SELECT n FROM pool_t ORDER BY n").rows.map { |r| r.int(0) })
+      pool.exec("DROP TABLE pool_t")
+      nil
+    end
+  end
+
+  # A lease given back at the moment the wait times out is not lost.
+  def test_timeouts_lose_no_connection
+    PG::Pool.open(url, size: 1, checkout_timeout: 20.ms) do |pool: PG::Pool|
+      Task.scope do |s|
+        20.times do
+          s.spawn do
+            begin
+              pool.with { |_| Task.sleep(19.ms) }
+            rescue PG::PoolTimeout
+              nil
+            end
+          end
+          s.spawn do
+            begin
+              pool.exec("SELECT 1")
+            rescue PG::PoolTimeout
+              nil
+            end
+            nil
+          end
+        end
+      end
+      assert_equal(1, pool.exec("SELECT 1").rows[0].int(0))
+      assert_true(pool.size <= 1)
+      nil
+    end
+  end
+
+  def test_checkout_timeout
+    PG::Pool.open(url, size: 1, checkout_timeout: 100.ms) do |pool: PG::Pool|
+      Task.scope do |s|
+        busy = s.spawn { pool.exec("SELECT pg_sleep(0.6)") }
+        Task.sleep(100.ms)
+        assert_raise_message(/no connection free within/) { pool.exec("SELECT 1") }
+        busy.await
+      end
+      assert_equal(1, pool.exec("SELECT 1").rows[0].int(0))
+      nil
+    end
+  end
+
+  def test_cut_short_work_closes_its_connection
+    PG::Pool.open(url, size: 1) do |pool|
+      pid = pool.with { |c| c.process_id }
+      assert_raise(Task::Timeout) { Task.timeout(100.ms) { pool.exec("SELECT pg_sleep(1)") } }
+      assert_equal(0, pool.size)
+      assert_false(pool.with { |c| c.process_id } == pid)
+      nil
+    end
+  end
+
+  # A waiter learns that a connection was dropped (not given back), and
+  # opens another.
+  def test_waiter_woken_by_a_dropped_connection
+    PG::Pool.open(url, size: 1) do |pool: PG::Pool|
+      Task.scope do |s|
+        holder = s.spawn do
+          begin
+            Task.timeout(200.ms) { pool.exec("SELECT pg_sleep(2)") }
+            "finished"
+          rescue Task::Timeout
+            "cut short"
+          end
+        end
+        Task.sleep(50.ms)
+        waiter = s.spawn { pool.query("SELECT 5").rows[0].int(0) }
+        assert_equal("cut short", holder.await)
+        assert_equal(5, Task.timeout(5.seconds) { waiter.await })
+      end
+      nil
+    end
+  end
+
+  def test_killed_connection_is_replaced
+    admin = PG.connect(url)
+    PG::Pool.open(url, size: 1) do |pool|
+      pid = pool.with { |c| c.process_id }
+      admin.query("SELECT pg_terminate_backend($1)", [pid])
+      Task.sleep(100.ms)
+      # The work that finds the connection dead fails; the next gets a new one.
+      assert_raise(PG::Error) { pool.exec("SELECT 1") }
+      assert_false(pool.with { |c| c.process_id } == pid)
+      assert_equal(1, pool.exec("SELECT 1").rows[0].int(0))
+      nil
+    end
+    admin.close
+  end
+
+  def test_new_and_close
+    pool = PG::Pool.new(url, size: 2)
+    assert_equal(1, pool.query("SELECT 1").rows[0].int(0))
+    assert_equal(1, pool.size)
+    pool.close
+    assert_true(pool.closed?)
+    assert_equal(0, pool.size)
+    assert_raise_message(/pool closed/) { pool.exec("SELECT 1") }
+    pool.close
+  end
+
+  # Leases behind a wake-up token are closed too.
+  def test_close_drains_past_tokens
+    pool = PG::Pool.new(url, size: 3)
+    Task.scope do |s|
+      a = s.spawn { pool.with { |_| Task.sleep(100.ms) } }
+      b = s.spawn do
+        begin
+          Task.timeout(50.ms) { pool.exec("SELECT pg_sleep(1)") }
+        rescue Task::Timeout
+          nil
+        end
+        nil
+      end
+      c = s.spawn { pool.with { |_| Task.sleep(100.ms) } }
+      a.await
+      b.await
+      c.await
+    end
+    pool.close
+    assert_equal(0, pool.size)
+  end
+
+  def test_close_while_in_use
+    pool = PG::Pool.new(url, size: 1)
+    pool.with do |c|
+      pool.close
+      assert_equal(1, c.exec("SELECT 1").rows[0].int(0))
+    end
+    assert_equal(0, pool.size)
+  end
+
+  def test_waiters_see_the_close
+    pool = PG::Pool.new(url, size: 1)
+    Task.scope do |s|
+      holder = s.spawn { pool.with { |_| Task.sleep(300.ms) } }
+      Task.sleep(50.ms)
+      # A task of the scope that raised would cancel the others: catch it.
+      waiter = s.spawn do
+        begin
+          pool.exec("SELECT 1")
+          "served"
+        rescue PG::ConnectionError => e
+          e.message
+        end
+      end
+      Task.sleep(50.ms)
+      pool.close
+      assert_equal("pool closed", waiter.await)
+      holder.await
+    end
+  end
+
+  def test_unreachable_server
+    PG::Pool.open("postgres://u@127.0.0.1:1/db", size: 1) do |pool|
+      assert_raise(PG::ConnectionError) { pool.exec("SELECT 1") }
+      assert_equal(0, pool.size)
+      nil
+    end
+  end
+
+  def test_bad_size
+    assert_raise(ArgumentError) { PG::Pool.new(url, size: 0) }
+  end
+end

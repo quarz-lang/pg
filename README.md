@@ -57,7 +57,26 @@ used any further; `PG::TransactionError` and `PG::NullError` are misuses.
   (26000) or says changed under it (0A000, outside a transaction) is
   prepared again and the call retried once.
 
-Next: a connection pool.
+- `PG::Pool.open(url, size:, checkout_timeout:) { |pool| ... }` (or
+  `PG::Pool.new` and `#close`): connections shared by tasks on any
+  worker. An idle connection is kept as a Shareable `PG::Lease` (its
+  socket and session state); `pool.with { |c| ... }` makes a
+  `PG::Connection` of one in the calling task, runs an ordinary block,
+  and gives it back (rolled back first if the block left a transaction
+  open; closed instead if it broke or a call was cut short, and replaced
+  when needed). `pool.exec`, `pool.query`, `pool.transaction` are
+  shortcuts. `checkout_timeout` bounds the wait for a free connection
+  (`PG::PoolTimeout`). Prepared statements stay with their connection.
+  `PG::Connection#release` and `.adopt` move a single connection between
+  tasks the same way.
+
+```ruby
+PG::Pool.open("postgres://app@localhost/shop", size: 8) do |pool|
+  Task.scope do |s|
+    100.times { |i| s.spawn { pool.query("INSERT INTO hits VALUES ($1)", [i]) } }
+  end
+end
+```
 
 Not yet: TLS, LISTEN/NOTIFY as an API, COPY, cancel requests.
 

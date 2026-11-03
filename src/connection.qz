@@ -24,7 +24,21 @@ public def connect(*, host: String = "localhost", port: Int = 5432, user: String
                              statement_cache_size:))
 end
 
-# A session with the server: one task's at a time.
+# What a connection is made of, as a Shareable value: its socket and the
+# session's state, so that it can move to another task, which makes a
+# `PG::Connection` of it again (`PG::Connection#release`,
+# `PG::Connection.adopt`). `PG::Pool` keeps its idle connections so.
+data Lease = (
+  io: IO,
+  config: Config,
+  process_id: Int,
+  secret: Bytes,
+  parameters: Hash[String, String],
+  statements: StatementCache::Snapshot
+)
+
+# A session with the server: one task's at a time. Moving it to another
+# task goes through a `PG::Lease`.
 class Connection
   # How many prepared statements `#query` keeps by default.
   STATEMENT_CACHE_SIZE = 100
@@ -89,6 +103,44 @@ class Connection
   def initialize(@config: Config, @io: IO)
     @reader = MessageReader.new(io)
     @statements = StatementCache.new(@config.statement_cache_size)
+  end
+
+  # The connection `lease` describes (see `.adopt`).
+  def initialize(lease: Lease)
+    @config = lease.config
+    @io = lease.io
+    @reader = MessageReader.new(lease.io)
+    @statements = StatementCache.new(lease.statements)
+    @parameters = lease.parameters
+    @process_id = lease.process_id
+    @secret = lease.secret
+  end
+
+  # Makes a connection of `lease` in the calling task: the session goes on
+  # where `#release` left it (idle, its prepared statements kept). A lease
+  # is used once.
+  def self.adopt(lease: Lease) -> Connection = Connection.new(lease)
+
+  # Gives the session up as a `PG::Lease`, for another task to `.adopt`;
+  # this object is closed for use afterwards (its socket stays open). Only
+  # an idle session is given up: one in a transaction is rolled back
+  # first. Returns nil, closing the socket, when the session cannot go on:
+  # it is closed or broken, or the rollback failed. Never raises.
+  def release -> Lease?
+    return nil if @closed
+    begin
+      exec("ROLLBACK") unless @status == "I"
+    rescue Exception
+      close_io
+      @closed = true
+      return nil
+    end
+    if @status != "I"
+      close
+      return nil
+    end
+    @closed = true
+    Lease.new(@io, @config, @process_id, @secret, @parameters, @statements.snapshot)
   end
 
   # The run-time parameters the server reported (server_version,
@@ -308,10 +360,11 @@ class Connection
   # leaves before the end (a cancelled task, an exception) closes the
   # connection.
   private def converse(request: Bytes, &handle: (Backend) -> Void) -> Void
-    send(request)
     error: ServerError? = nil
     done = false
     begin
+      # Inside: a write cut short leaves part of a request on the wire.
+      send(request)
       loop do
         m = begin
           receive
@@ -362,7 +415,8 @@ class Connection
     @closed = true
     begin
       @io.write(Frontend.terminate)
-    rescue IOError, SystemCallError
+    rescue Exception
+      # Even a cancelled task closes the socket.
     end
     close_io
   end

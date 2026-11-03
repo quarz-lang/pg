@@ -1,0 +1,184 @@
+# Connections shared by many tasks, on any worker. An idle connection is
+# kept as a `PG::Lease` (its socket and its session's state, Shareable);
+# a task that needs one takes a lease and makes a `PG::Connection` of it
+# in its own task, and gives it back when done.
+#
+#     PG::Pool.open("postgres://app@localhost/shop", size: 8) do |pool|
+#       Task.scope do |s|
+#         8.times { |i| s.spawn { pool.query("SELECT $1::int", [i]) } }
+#       end
+#       pool.transaction { |c| c.exec("UPDATE stock SET n = n - 1") }
+#     end
+#
+# The rules:
+#
+# - Connections are opened when needed, up to `size`. A call waits for a
+#   free one at most `checkout_timeout` when it is given (then it raises
+#   `PG::PoolTimeout`); the work itself is not bounded by it.
+# - The work runs in the caller's task, and its exceptions are the
+#   caller's. When it returns, the connection goes back to the pool if it
+#   is idle (a transaction the work left open is rolled back first);
+#   otherwise (broken, or a call cut short by cancellation or a timeout)
+#   it is closed, and the pool opens another when one is needed.
+# - `#close`, or the end of `.open`'s block, closes the idle connections
+#   and those given back later; calls waiting for one raise
+#   `PG::ConnectionError` ("pool closed").
+class Pool
+  include Shareable
+
+  @config: Config
+  @size: Int
+  @checkout_timeout: Duration?
+  # Idle connections, and nil for a connection closed instead of given
+  # back: it wakes a waiter, who may then open one.
+  @idle: Channel[Lease?]
+  # How many connections exist, idle or in use.
+  @opened: Atom[Int]
+
+  # A pool of up to `size` connections to the server `url` names (see
+  # `PG.connect`); close it with `#close`. `.open` closes it for you.
+  def initialize(url: String, @size: Int = 10, @checkout_timeout: Duration? = nil)
+    raise ArgumentError.new("a pool of #{size} connections") if size < 1
+    @config = parse_url(url)
+    @idle = Channel[Lease?].new(size)
+    @opened = Atom[Int].new(0)
+  end
+
+  # As `.new(url)`, with a `PG::Config`.
+  def initialize(@config: Config, @size: Int = 10, @checkout_timeout: Duration? = nil)
+    raise ArgumentError.new("a pool of #{size} connections") if size < 1
+    @idle = Channel[Lease?].new(size)
+    @opened = Atom[Int].new(0)
+  end
+
+  # Runs the block with a new pool (see `.new`), and closes the pool when
+  # the block ends. Returns the block's value.
+  def self.open[R](url: String, size: Int = 10, checkout_timeout: Duration? = nil, &: (Pool) -> R) -> R
+    pool = Pool.new(url, size:, checkout_timeout:)
+    begin
+      yield pool
+    ensure
+      pool.close
+    end
+  end
+
+  # Runs the block with a connection of the pool, in the calling task, and
+  # returns its value (see the class's rules). The connection is the
+  # pool's: a block that calls its `PG::Connection#release` takes it out
+  # of the pool.
+  def with[R](&: (Connection) -> R) -> R
+    conn = checkout
+    begin
+      yield conn
+    ensure
+      checkin(conn)
+    end
+  end
+
+  # `PG::Connection#exec` on a connection of the pool.
+  def exec(sql: String) -> Result = with { |c| c.exec(sql) }
+
+  # `PG::Connection#query` on a connection of the pool.
+  def query(sql: String, params: Array[Object?] = []) -> Result = with { |c| c.query(sql, params) }
+
+  # `PG::Connection#transaction` on a connection of the pool.
+  def transaction[R](&: (Connection) -> R) -> R
+    with { |c| c.transaction { |tx| yield tx } }
+  end
+
+  # How many connections are open, idle or in use.
+  def size -> Int = @opened.get
+
+  # Whether `#close` was called.
+  def closed? -> Bool = @idle.closed?
+
+  # Closes the idle connections now, and the others when they are given
+  # back; later calls raise `PG::ConnectionError`. Closing again does
+  # nothing.
+  def close -> Void
+    @idle.close
+    # try_receive gives nil for a wake-up token too: go by emptiness.
+    until @idle.empty?
+      if (lease = @idle.try_receive)
+        discard(lease)
+      end
+    end
+  end
+
+  private def checkout -> Connection
+    loop do
+      raise ConnectionError.new("pool closed") if @idle.closed?
+      if (lease = @idle.try_receive)
+        return Connection.adopt(lease)
+      end
+      n = @opened.get
+      if n < @size
+        next unless @opened.compare_and_set(n, n + 1)
+        begin
+          return Connection.open(@config)
+        rescue Exception => e
+          @opened.update { |k| k - 1 }
+          raise e
+        end
+      end
+      lease = wait_for_lease
+      return Connection.adopt(lease) if lease
+    end
+  end
+
+  # A lease given back, or nil when the pool closed or a connection was
+  # dropped meanwhile (then the caller may open one). The wait and its
+  # time limit are one `Channel.select`, so that a lease is never taken by
+  # a wait that then reports a timeout (it would be lost).
+  private def wait_for_lease -> Lease?
+    limit = @checkout_timeout
+    unless limit
+      begin
+        return @idle.receive
+      rescue Channel::Closed
+        return nil
+      end
+    end
+    got: Lease? = nil
+    timed_out = false
+    begin
+      Channel.select do |s|
+        s.receive(@idle) { |lease| got = lease }
+        s.after(limit) { timed_out = true }
+      end
+    rescue Channel::Closed
+      return nil
+    end
+    raise PoolTimeout.new("no connection free within #{limit}") if timed_out
+    got
+  end
+
+  private def checkin(conn: Connection) -> Void
+    lease = conn.release
+    unless lease
+      @opened.update { |k| k - 1 }
+      wake
+      return
+    end
+    sent = begin
+      @idle.try_send(lease)
+    rescue Channel::Closed
+      false
+    end
+    discard(lease) unless sent
+  end
+
+  # Tells a waiter, if any, that a connection may be opened.
+  private def wake -> Void
+    @idle.try_send(nil)
+  rescue Channel::Closed
+  end
+
+  # Closes an idle connection; the count drops even when the caller is
+  # cancelled meanwhile.
+  private def discard(lease: Lease) -> Void
+    Task.uncancellable { Connection.adopt(lease).close }
+  ensure
+    @opened.update { |k| k - 1 }
+  end
+end

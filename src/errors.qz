@@ -73,3 +73,7 @@ end
 # `PG::Connection#transaction` was called inside a transaction.
 class TransactionError < Error
 end
+
+# No connection of a `PG::Pool` was free within its `checkout_timeout`.
+class PoolTimeout < Error
+end

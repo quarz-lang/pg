@@ -35,6 +35,12 @@ class ScramTest < Test::Case
     assert_raise(PG::AuthenticationError) { s.verify("x=1") }
   end
 
+  def test_iteration_cap
+    assert_raise_message(/1000001 iterations, more than the 1000000 allowed/) do
+      scram.client_final("r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000001")
+    end
+  end
+
   def test_verify_before_final
     assert_raise(PG::AuthenticationError) { scram.verify(SERVER_FINAL) }
   end
@@ -50,6 +56,7 @@ class ScramTest < Test::Case
      "r=rOprNGfwEbeRWgbNEkqOx,s=!!,i=4096",
      "r=rOprNGfwEbeRWgbNEkqOx,r=rOprNGfwEbeRWgbNEkqOy,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
      "m=ext,r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+     "r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000001",
      "garbage"].each do |m|
       assert_raise(PG::AuthenticationError) { scram.client_final(m) }
     end

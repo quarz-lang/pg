@@ -14,6 +14,11 @@ class Scram
   # The mechanism's name, as the server lists it.
   MECHANISM = "SCRAM-SHA-256"
 
+  # The most PBKDF2 rounds a server may ask for: the server is not trusted
+  # before its signature is checked, and a huge count would keep the
+  # client hashing (PostgreSQL's default is 4096).
+  MAX_ITERATIONS = 1_000_000
+
   @password: String
   @nonce: String
   @user: String
@@ -41,6 +46,7 @@ class Scram
     count = attrs["i"]? || fail("no iteration count")
     fail("an iteration count of #{count.inspect}") unless count.match?(/\A[1-9][0-9]{0,8}\z/)
     rounds = count.to_i
+    fail("the server asks for #{rounds} iterations, more than the #{MAX_ITERATIONS} allowed") if rounds > MAX_ITERATIONS
     fail("a nonce that does not extend the client's") unless nonce.start_with?(@nonce) && nonce.size > @nonce.size
     salted = Digest::PBKDF2.sha256(@password, decode(salt), rounds, 32)
     client_key = Digest::HMAC.sha256(salted, "Client Key")

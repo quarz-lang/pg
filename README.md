@@ -35,14 +35,23 @@ included: SQLSTATE 28P01 for a wrong password); `PG::ConnectionError`
 (with `PG::AuthenticationError` and `PG::ProtocolError` under it) means
 the connection failed or cannot be used any further.
 
-URLs follow libpq's, with these differences for now: no host means
-localhost over TCP (libpq: the default unix socket), one host only, and
-the default user is `$PGUSER` or `$USER`.
 
 Next: simple and extended queries with typed results, a connection
 pool.
 
 Not yet: TLS, LISTEN/NOTIFY as an API, COPY, cancel requests.
+
+## Differences from libpq
+
+For now, to be revisited:
+
+- A URL without a host connects to localhost over TCP (libpq: the
+  default unix socket).
+- One host per URL (libpq takes a comma-separated list).
+- The default user is `$PGUSER`, then `$USER` (libpq: the operating
+  system's user name).
+- No TLS: `sslmode` may be `disable`, `allow` or `prefer` only.
+- A SCRAM iteration count above 1,000,000 is refused.
 
 ## Development
 

@@ -17,6 +17,10 @@ class TestServer
 
   def url -> String = @url
 
+  # Whether the cluster is ours, with the md5 and cleartext roles' lines
+  # in its pg_hba.conf.
+  def ours? -> Bool = !@dir.nil?
+
   # The socket directory of a cluster of ours (nil otherwise).
   def socket_dir -> String? = @dir
 
@@ -41,6 +45,14 @@ class TestServer
       File.write("#{dir}/password", password)
       run("#{bin}/initdb", "-D", "#{dir}/data", "-U", "quarz", "--auth=scram-sha-256",
           "--pwfile=#{dir}/password", "-E", "UTF8", "--locale=C")
+      # md5 and cleartext for two roles the tests create, SCRAM for the
+      # rest (the first matching line wins).
+      File.write("#{dir}/data/pg_hba.conf", <<~HBA)
+        host all md5_user 127.0.0.1/32 md5
+        host all clear_user 127.0.0.1/32 password
+        local all all scram-sha-256
+        host all all 127.0.0.1/32 scram-sha-256
+      HBA
       port = start_on_a_free_port(bin, dir)
       TestServer.new("postgres://quarz:#{password}@127.0.0.1:#{port}/postgres", dir, bin)
     rescue Exception => e

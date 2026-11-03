@@ -24,9 +24,22 @@ Work in progress. What exists:
   with `allow_cleartext: true`) or trust, `connect_timeout`. Server
   errors raise `PG::Error` (SQLSTATE `code`, `detail`, `hint`, ...).
 
+- `conn.exec(sql)` (simple protocol; several statements, the last
+  result; `exec_all` for all of them) and `conn.query(sql, params)`
+  (extended protocol, `$1`... sent apart from the SQL: nil, Int, Float,
+  String, Bool, Bytes, Time, Symbol), returning a `PG::Result`: columns,
+  `PG::Row`s with the server's text (`row["name"]`) and typed readers
+  (`int`, `float`, `string`, `bool`, `bytes`, `time`, each with a `?`
+  form for NULL), `command_tag`, `affected`. After an error the
+  connection stays usable.
+- `conn.transaction { |c| ... }`: BEGIN, then COMMIT, or ROLLBACK when
+  the block raises; `on_notice { |fields| ... }`.
+
 ```ruby
 conn = PG.connect("postgres://ann:secret@localhost/shop")
-puts conn.server_version
+conn.query("SELECT id, name FROM users WHERE id = $1", [42]).each do |row|
+  puts "#{row.int("id")} #{row.string("name")}"
+end
 conn.close
 ```
 
@@ -36,8 +49,7 @@ included: SQLSTATE 28P01 for a wrong password); `PG::ConnectionError`
 the connection failed or cannot be used any further.
 
 
-Next: simple and extended queries with typed results, a connection
-pool.
+Next: a prepared-statement cache, a connection pool.
 
 Not yet: TLS, LISTEN/NOTIFY as an API, COPY, cancel requests.
 

@@ -58,3 +58,11 @@ class Error < StandardError
     (d = fields["D"]?) ? "#{s}\nDETAIL: #{d}" : s
   end
 end
+
+# A typed reader of a row found NULL (use its `?` form to get nil).
+class NullError < StandardError
+end
+
+# `PG::Connection#transaction` was called inside a transaction.
+class TransactionError < StandardError
+end

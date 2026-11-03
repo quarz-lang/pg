@@ -26,6 +26,8 @@ class Connection
   var @secret: Bytes = Bytes.new
   var @status: String = "I"
   var @closed: Bool = false
+  var @notice_handler: ((Hash[String, String]) -> Void)? = nil
+  var @notice_error: StandardError? = nil
 
   # Connects with `config` and authenticates (see `PG.connect`).
   def self.open(config: Config) -> Connection
@@ -98,6 +100,196 @@ class Connection
     end
   end
 
+  # Calls the block with each notice or warning the server sends (its
+  # fields, as `PG::Error#fields`); without a handler they are dropped.
+  def on_notice(&handler: (Hash[String, String]) -> Void) -> Void
+    @notice_handler = handler
+  end
+
+  # Runs `sql` (one statement or several, separated by `;`) with the
+  # simple protocol, and returns the last statement's result. Raises
+  # `PG::Error` for the first statement that fails, after which the
+  # statements after it do not run (and, outside a transaction block, the
+  # ones before it stay done). Takes no parameters: use `#query` for
+  # values.
+  #
+  # A call that does not read the server's whole answer (its task was
+  # cancelled or timed out, or a notice handler raised) closes the
+  # connection: what is left of the answer would be taken for the next
+  # one's.
+  def exec(sql: String) -> Result = exec_all(sql).last? || Result.new([], [], "")
+
+  # As `#exec`, but returns every statement's result, in order.
+  def exec_all(sql: String) -> Array[Result]
+    results: Array[Result] = []
+    columns: Array[Field] = []
+    rows: Array[Row] = []
+    converse(Frontend.query(sql)) do |m|
+      case m
+      in Backend::RowDescription(fields:)
+        columns = fields
+        rows = []
+      in Backend::DataRow(values:)
+        rows = rows.push(Row.new(columns, values))
+      in Backend::CommandComplete(tag:)
+        results = results.push(Result.new(columns, rows, tag))
+        columns = []
+        rows = []
+      in Backend::EmptyQueryResponse
+        results = results.push(Result.new([], [], ""))
+      else
+        unexpected(m, "in a simple query")
+      end
+    end
+    results
+  end
+
+  # Runs one statement with the extended protocol, `params` standing for
+  # `$1`, `$2`, ...: each is sent apart from the SQL, so no value needs
+  # quoting. A parameter may be nil (NULL), an Int, a Float, a String, a
+  # Bool, Bytes (bytea), a Time (sent in UTC) or a Symbol (its name);
+  # another raises `ArgumentError`. Raises `PG::Error` when the statement
+  # fails. A call cut short closes the connection, as `#exec` says.
+  def query(sql: String, params: Array[Object?] = []) -> Result
+    values = params.map { |p| Connection.encode(p) }
+    columns: Array[Field] = []
+    rows: Array[Row] = []
+    tag = ""
+    request = Frontend.parse("", sql) + Frontend.bind("", "", values) + Frontend.describe_portal("") +
+              Frontend.execute("") + Frontend.sync
+    converse(request) do |m|
+      case m
+      in Backend::ParseComplete | Backend::BindComplete | Backend::NoData | Backend::EmptyQueryResponse
+        nil
+      in Backend::RowDescription(fields:)
+        columns = fields
+      in Backend::DataRow(values:)
+        rows = rows.push(Row.new(columns, values))
+      in Backend::CommandComplete(tag: t)
+        tag = t
+      else
+        unexpected(m, "in an extended query")
+      end
+    end
+    Result.new(columns, rows, tag)
+  end
+
+  # Runs the block in a transaction: BEGIN, then COMMIT when the block
+  # returns, or ROLLBACK when it raises (the exception goes on) or leaves
+  # otherwise (`return`, `break`). When a statement in the block failed
+  # and the block went on after rescuing it, the server rolls the
+  # transaction back at COMMIT; this raises `PG::Error` (SQLSTATE 25P02)
+  # then, rather than returning as if it had been committed. Returns the
+  # block's value. Raises `PG::TransactionError` when the connection is in
+  # a transaction already: there are no nested transactions (no
+  # savepoints) yet.
+  def transaction[R](&: (Connection) -> R) -> R
+    unless @status == "I"
+      raise TransactionError.new("already in a transaction: nested transactions are not supported yet")
+    end
+    exec("BEGIN")
+    settled = false
+    result = begin
+      r = yield self
+      settled = true
+      r
+    rescue Exception => e
+      settled = true
+      rollback_quietly
+      raise e
+    ensure
+      # `return` or `break` out of the block.
+      rollback_quietly unless settled
+    end
+    if exec("COMMIT").command_tag == "ROLLBACK"
+      raise Error.new({ "S" => "ERROR", "V" => "ERROR", "C" => "25P02",
+                        "M" => "the transaction was aborted by an earlier error and rolled back" })
+    end
+    result
+  end
+
+  # A parameter's text, as the server reads it (nil for NULL). A Time is
+  # sent in UTC, so that a `timestamp` column (without zone), which drops
+  # the offset, keeps the instant as `PG::Row#time` reads it back.
+  #
+  # ```
+  # PG::Connection.encode(true)                # => b"t"
+  # PG::Connection.encode(b"\x01\xff")       # => b"\\x01ff"
+  # PG::Connection.encode(-Float::INFINITY)    # => b"-Infinity"
+  # ```
+  def self.encode(value: Object?) -> Bytes?
+    text = case value
+           in nil then return nil
+           in Bool => b then b ? "t" : "f"
+           in Int => i then i.to_s
+           in Float => f
+             if f.nan?
+               "NaN"
+             elsif f.infinite?
+               f > 0 ? "Infinity" : "-Infinity"
+             else
+               f.to_s
+             end
+           in String => s then s
+           in Symbol => s then s.to_s
+           in Bytes => b then return "\\x#{b.hex}".to_bytes
+           in Time => t then t.utc.iso8601(6)
+           else raise ArgumentError.new("a parameter of class #{value.class.name}: " +
+                                        "give nil, Int, Float, String, Bool, Bytes, Time or Symbol")
+           end
+    text.to_bytes
+  end
+
+  # Sends `request` and reads the answer up to ReadyForQuery, giving the
+  # block every message but errors (the first is raised at the end, after
+  # the connection is in step again) and ReadyForQuery. Anything that
+  # leaves before the end (a cancelled task, an exception) closes the
+  # connection.
+  private def converse(request: Bytes, &handle: (Backend) -> Void) -> Void
+    send(request)
+    error: Error? = nil
+    done = false
+    begin
+      loop do
+        m = begin
+          receive
+        rescue ConnectionError => e
+          # A FATAL error just before the server hung up says more.
+          raise error || e
+        end
+        case m
+        in Backend::ErrorResponse(fields:)
+          error = error || Error.new(fields)
+        in Backend::ReadyForQuery(status:)
+          @status = status
+          done = true
+          break
+        else
+          handle.call(m)
+        end
+      end
+    ensure
+      unless done
+        @closed = true
+        close_io
+      end
+    end
+    raise error if error
+    if (e = @notice_error)
+      @notice_error = nil
+      raise e
+    end
+  end
+
+  # Rolls back the transaction `#transaction` began, unless the
+  # connection broke (the server then rolls it back itself). Errors are
+  # dropped: the block's exception, if any, is the one to report.
+  private def rollback_quietly -> Void
+    return if @closed
+    exec("ROLLBACK")
+  rescue Exception
+  end
+
   # Whether `#close` was called, or the connection broke.
   def closed? -> Bool = @closed
 
@@ -116,7 +308,9 @@ class Connection
   # The startup exchange: authentication, then the session's parameters,
   # up to the first ReadyForQuery. Called by `PG.connect`.
   def startup -> Void
-    params = { "user" => @config.user, "client_encoding" => "UTF8" }
+    # The readers of `PG::Row` read ISO dates and floats in full.
+    params = { "user" => @config.user, "client_encoding" => "UTF8", "DateStyle" => "ISO",
+               "extra_float_digits" => "3" }
     if (db = @config.database)
       params = params.put("database", db)
     end
@@ -136,6 +330,8 @@ class Connection
       in Backend::NegotiateProtocolVersion
         # Protocol 3.0 asked for and spoken; only options went unknown.
         nil
+      in Backend::ErrorResponse(fields:)
+        refused(fields)
       else
         unexpected(m, "while starting")
       end
@@ -179,10 +375,19 @@ class Connection
       in Backend::AuthenticationOther(code:)
         raise AuthenticationError.new("the server asks for an authentication method this client " +
                                       "does not speak (code #{code}: Kerberos, GSSAPI or SSPI)")
+      in Backend::ErrorResponse(fields:)
+        refused(fields)
       else
         unexpected(m, "while authenticating")
       end
     end
+  end
+
+  # The server refused the session: it closes the connection.
+  private def refused(fields: Hash[String, String]) -> Nothing
+    @closed = true
+    close_io
+    raise Error.new(fields)
   end
 
   # A server that started SCRAM and then asks for a weaker method is not
@@ -208,8 +413,7 @@ class Connection
   end
 
   # The next message that is not about the session itself: parameter
-  # changes are recorded, notices dropped, and an error is raised as a
-  # `PG::Error`.
+  # changes are recorded, and notices go to the handler.
   private def receive -> Backend
     loop do
       m = begin
@@ -225,10 +429,16 @@ class Connection
       case m
       in Backend::ParameterStatus(name:, value:)
         @parameters = @parameters.put(name, value)
-      in Backend::NoticeResponse
+      in Backend::NoticeResponse(fields:)
+        begin
+          @notice_handler&.call(fields)
+        rescue StandardError => e
+          # Raised once the answer is read, to keep the stream in step.
+          @notice_error = @notice_error || e
+        end
+      in Backend::NotificationResponse
+        # LISTEN/NOTIFY has no API yet: dropped.
         nil
-      in Backend::ErrorResponse(fields:)
-        raise Error.new(fields)
       else
         return m
       end

@@ -1,0 +1,157 @@
+# A column of a row description.
+data Field = (
+  # The column's name.
+  name: String,
+  # The table's OID, or 0 when the column is not a table's.
+  table: Int,
+  # The column's number in its table, or 0.
+  column: Int,
+  # The OID of the column's type.
+  type: Int,
+  # `pg_type.typlen`: negative for a type of variable size.
+  size: Int,
+  # `pg_attribute.atttypmod`.
+  modifier: Int,
+  # 0 text, 1 binary.
+  format: Int
+)
+
+# The messages a server sends, decoded.
+enum Backend
+  # Authentication succeeded.
+  variant AuthenticationOk
+  # The server asks for the password in clear.
+  variant AuthenticationCleartextPassword
+  # The server asks for the password hashed with MD5 and this salt.
+  variant AuthenticationMD5Password(salt: Bytes)
+  # The server asks for SASL with one of these mechanisms.
+  variant AuthenticationSASL(mechanisms: Array[String])
+  # A SASL challenge: the mechanism's data.
+  variant AuthenticationSASLContinue(data: Bytes)
+  # The SASL outcome: the mechanism's last data.
+  variant AuthenticationSASLFinal(data: Bytes)
+  # A method this client does not speak (Kerberos, GSSAPI, SSPI): its
+  # code.
+  variant AuthenticationOther(code: Int)
+  # A run-time parameter and its value, at startup and when it changes.
+  variant ParameterStatus(name: String, value: String)
+  # The key a cancel request names: 4 bytes before protocol 3.2, up to
+  # 256 after.
+  variant BackendKeyData(process_id: Int, secret: Bytes)
+  # `I` idle, `T` in a transaction, `E` in a failed transaction.
+  variant ReadyForQuery(status: String)
+  # The columns of the rows that follow.
+  variant RowDescription(fields: Array[Field])
+  # Each column's value, nil for NULL.
+  variant DataRow(values: Array[Bytes?])
+  # A statement finished: its command tag (`INSERT 0 1`, `SELECT 2`).
+  variant CommandComplete(tag: String)
+  # The query was empty.
+  variant EmptyQueryResponse
+  # The fields by their one-letter codes (`S` severity, `C` SQLSTATE,
+  # `M` message, `D` detail, `H` hint, `P` position, ...).
+  variant ErrorResponse(fields: Hash[String, String])
+  # A notice or warning, with the fields an error has.
+  variant NoticeResponse(fields: Hash[String, String])
+  # A Parse succeeded.
+  variant ParseComplete
+  # A Bind succeeded.
+  variant BindComplete
+  # A Close succeeded.
+  variant CloseComplete
+  # The statement or portal described returns no rows.
+  variant NoData
+  # Execute stopped at its row limit; the portal has more.
+  variant PortalSuspended
+  # A prepared statement's parameter types (OIDs).
+  variant ParameterDescription(types: Array[Int])
+  # A NOTIFY on a channel this session listens to.
+  variant NotificationResponse(process_id: Int, channel: String, payload: String)
+  # The newest minor version the server speaks, and the startup options
+  # it did not recognize.
+  variant NegotiateProtocolVersion(minor: Int, options: Array[String])
+
+  # The message of type `type` (its byte) with the body `body`. Raises
+  # `PG::ProtocolError` for a type this client does not know (COPY's
+  # among them, for now) or a body that does not parse.
+  #
+  # ```
+  # PG::Backend.decode('Z'.ord, b"I")   # => PG::Backend::ReadyForQuery(status: "I")
+  # ```
+  def self.decode(type: Int, body: Bytes) -> Backend
+    r = Wire::Reader.new(body)
+    message = case type.chr
+              when "R" then authentication(r)
+              when "S" then ParameterStatus.new(r.cstring, r.cstring)
+              when "K" then BackendKeyData.new(r.int32, key_secret(r))
+              when "Z" then ReadyForQuery.new(ready_status(r.byte))
+              when "T" then RowDescription.new(Array.new(r.uint16) { field(r) })
+              when "D" then DataRow.new(Array.new(r.uint16) { value(r) })
+              when "C" then CommandComplete.new(r.cstring)
+              when "I" then EmptyQueryResponse
+              when "E" then ErrorResponse.new(notice_fields(r))
+              when "N" then NoticeResponse.new(notice_fields(r))
+              when "1" then ParseComplete
+              when "2" then BindComplete
+              when "3" then CloseComplete
+              when "n" then NoData
+              when "s" then PortalSuspended
+              when "t" then ParameterDescription.new(Array.new(r.uint16) { r.uint32 })
+              when "A" then NotificationResponse.new(r.int32, r.cstring, r.cstring)
+              when "v" then NegotiateProtocolVersion.new(r.int32, Array.new(r.int32) { r.cstring })
+              else raise ProtocolError.new("unknown message type #{type.chr.inspect}")
+              end
+    raise ProtocolError.new("#{r.remaining} bytes after a #{type.chr.inspect} message") unless r.done?
+    message
+  end
+
+  private def self.authentication(r: Wire::Reader) -> Backend
+    case code = r.int32
+    when 0 then AuthenticationOk
+    when 3 then AuthenticationCleartextPassword
+    when 5 then AuthenticationMD5Password.new(r.bytes(4))
+    when 10
+      mechanisms: Array[String] = []
+      while (m = r.cstring) != ""
+        mechanisms = mechanisms.push(m)
+      end
+      AuthenticationSASL.new(mechanisms)
+    when 11 then AuthenticationSASLContinue.new(r.rest)
+    when 12 then AuthenticationSASLFinal.new(r.rest)
+    else
+      r.rest
+      AuthenticationOther.new(code)
+    end
+  end
+
+  private def self.ready_status(byte: Int) -> String
+    s = byte.chr
+    raise ProtocolError.new("unknown transaction status #{s.inspect}") unless ["I", "T", "E"].include?(s)
+    s
+  end
+
+  private def self.field(r: Wire::Reader) -> Field
+    Field.new(r.cstring, r.uint32, r.int16, r.uint32, r.int16, r.int32, r.int16)
+  end
+
+  private def self.key_secret(r: Wire::Reader) -> Bytes
+    secret = r.rest
+    if secret.empty? || secret.size > 256
+      raise ProtocolError.new("a cancel key of #{secret.size} bytes")
+    end
+    secret
+  end
+
+  private def self.value(r: Wire::Reader) -> Bytes?
+    n = r.int32
+    n == -1 ? nil : r.bytes(n)
+  end
+
+  private def self.notice_fields(r: Wire::Reader) -> Hash[String, String]
+    fields: Hash[String, String] = {}
+    while (code = r.byte) != 0
+      fields = fields.put(code.chr, r.cstring)
+    end
+    fields
+  end
+end

@@ -1,0 +1,9 @@
+# The connection to the server failed or was closed: it cannot be used
+# any further.
+class ConnectionError < StandardError
+end
+
+# The server sent bytes that are not the protocol: the connection cannot
+# be used any further.
+class ProtocolError < ConnectionError
+end

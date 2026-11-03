@@ -14,21 +14,30 @@ class Scram
   # The mechanism's name, as the server lists it.
   MECHANISM = "SCRAM-SHA-256"
 
-  # The most PBKDF2 rounds a server may ask for: the server is not trusted
+  # The most PBKDF2 rounds a server may ask for, unless the connection
+  # says otherwise (`max_scram_iterations`): the server is not trusted
   # before its signature is checked, and a huge count would keep the
-  # client hashing (PostgreSQL's default is 4096).
+  # client hashing (PostgreSQL's default is 4096; from PostgreSQL 16 an
+  # administrator may raise `scram_iterations`).
   MAX_ITERATIONS = 1_000_000
+
+  # Above this many rounds, the hashing runs on a helper thread
+  # (`Task.blocking`), so that the worker's other tasks go on meanwhile.
+  BLOCKING_ITERATIONS = 10_000
 
   @password: String
   @nonce: String
   @user: String
+  @max_iterations: Int
   var @auth_message: String? = nil
   var @server_signature: Bytes? = nil
   var @verified: Bool = false
 
   # A new exchange for `password`, with a random 18-byte nonce unless one
   # is given (tests).
-  def initialize(@password: String, nonce: String? = nil, user: String = "")
+  def initialize(@password: String, nonce: String? = nil, user: String = "",
+                 max_iterations: Int = MAX_ITERATIONS)
+    @max_iterations = max_iterations
     @nonce = nonce || Base64.encode(Random.bytes(18))
     @user = user.gsub("=", "=3D").gsub(",", "=2C")
   end
@@ -44,11 +53,14 @@ class Scram
     nonce = attrs["r"]? || fail("no nonce")
     salt = attrs["s"]? || fail("no salt")
     count = attrs["i"]? || fail("no iteration count")
-    fail("an iteration count of #{count.inspect}") unless count.match?(/\A[1-9][0-9]{0,8}\z/)
+    fail("an iteration count of #{count.inspect}") unless count.match?(/\A[1-9][0-9]{0,9}\z/)
     rounds = count.to_i
-    fail("the server asks for #{rounds} iterations, more than the #{MAX_ITERATIONS} allowed") if rounds > MAX_ITERATIONS
+    if rounds > @max_iterations
+      fail("the server asks for #{rounds} iterations, more than the #{@max_iterations} allowed " +
+           "(raise the connection's max_scram_iterations to accept it)")
+    end
     fail("a nonce that does not extend the client's") unless nonce.start_with?(@nonce) && nonce.size > @nonce.size
-    salted = Digest::PBKDF2.sha256(@password, decode(salt), rounds, 32)
+    salted = Scram.salted_password(@password, decode(salt), rounds)
     client_key = Digest::HMAC.sha256(salted, "Client Key")
     stored_key = Digest::SHA256.digest(client_key)
     without_proof = "c=biws,r=#{nonce}"
@@ -77,6 +89,17 @@ class Scram
   # Whether `#verify` checked the server's signature: until then the
   # server has not proved that it knows the password.
   def verified? -> Bool = @verified
+
+  # PBKDF2-HMAC-SHA-256 of the password: on a helper thread when the
+  # count is large (`password` and `salt` are immutable, so the block may
+  # take them there).
+  def self.salted_password(password: String, salt: Bytes, rounds: Int) -> Bytes
+    if rounds > BLOCKING_ITERATIONS
+      Task.blocking { Digest::PBKDF2.sha256(password, salt, rounds, 32) }
+    else
+      Digest::PBKDF2.sha256(password, salt, rounds, 32)
+    end
+  end
 
   private def first_bare -> String = "n=#{@user},r=#{@nonce}"
 

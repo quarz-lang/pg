@@ -13,7 +13,9 @@ data Config = (
   # socket).
   allow_cleartext: Bool,
   # How long connecting and authenticating may take (nil: no limit).
-  connect_timeout: Duration?
+  connect_timeout: Duration?,
+  # The most SCRAM iterations the server may ask for (`PG::Scram`).
+  max_scram_iterations: Int
 )
 
 # Reads a connection URL, as libpq does:
@@ -21,8 +23,8 @@ data Config = (
 # (`postgresql://` too). The parts are percent-decoded; `host` may be a
 # socket directory (`%2Fvar%2Frun%2Fpostgresql`, or `?host=/var/run/...`);
 # the parameters `host`, `port`, `user`, `password`, `dbname`,
-# `application_name`, `connect_timeout` (seconds) and `sslmode` are
-# read. `sslmode` may be `disable`, `allow` or `prefer` (this client has
+# `application_name`, `connect_timeout` (seconds), `max_scram_iterations`
+# and `sslmode` are read. `sslmode` may be `disable`, `allow` or `prefer` (this client has
 # no TLS yet, so they all mean a plain connection); anything stronger
 # raises `ArgumentError`, as does a malformed URL.
 #
@@ -51,6 +53,7 @@ public def parse_url(url: String) -> Config
   database = (m[4] || "").empty? ? nil : Config.unescape(m[4] || "")
   application_name: String? = nil
   connect_timeout: Duration? = nil
+  max_scram_iterations = Scram::MAX_ITERATIONS
   (m[5] || "").split("&").each do |pair|
     next if pair.empty?
     key, _, value = pair.partition("=")
@@ -65,6 +68,9 @@ public def parse_url(url: String) -> Config
     when "connect_timeout"
       raise ArgumentError.new("connect_timeout: #{value.inspect}") unless value.match?(/\A[0-9]{1,9}\z/)
       connect_timeout = value.to_i == 0 ? nil : value.to_i.seconds
+    when "max_scram_iterations"
+      raise ArgumentError.new("max_scram_iterations: #{value.inspect}") unless value.match?(/\A[1-9][0-9]{0,9}\z/)
+      max_scram_iterations = value.to_i
     when "sslmode"
       unless ["disable", "allow", "prefer"].include?(value)
         raise ArgumentError.new("sslmode=#{value}: this client has no TLS yet")
@@ -76,7 +82,7 @@ public def parse_url(url: String) -> Config
   Config.new(host: host.empty? ? "localhost" : host, port: port,
              user: user || Config.default_user, password: password, database: database,
              application_name: application_name, allow_cleartext: false,
-             connect_timeout: connect_timeout)
+             connect_timeout: connect_timeout, max_scram_iterations: max_scram_iterations)
 end
 
 extension Config

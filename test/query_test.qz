@@ -213,6 +213,25 @@ class QueryTest < Test::Case
     assert_equal(t, row.time(1))
   end
 
+  # A role hashed with 20,000 SCRAM iterations (PostgreSQL 16+): the
+  # client hashes on a helper thread, and a lower cap refuses it.
+  def test_scram_iterations_above_the_default
+    admin = conn
+    omit_if(admin.server_version.to_i < 16, "scram_iterations needs PostgreSQL 16")
+    admin.exec("DROP ROLE IF EXISTS iter_user")
+    admin.exec("SET scram_iterations = 20000")
+    admin.exec("CREATE ROLE iter_user LOGIN PASSWORD 'iter-secret'")
+    config = PG.parse_url(server.url)
+    c = PG.connect(host: config.host, port: config.port, user: "iter_user", password: "iter-secret", database: "postgres")
+    assert_equal("iter_user", c.exec("SELECT current_user").rows[0].string(0))
+    c.close
+    assert_raise_message(/20000 iterations, more than the 10000 allowed/) do
+      PG.connect(host: config.host, port: config.port, user: "iter_user", password: "iter-secret",
+                 database: "postgres", max_scram_iterations: 10_000)
+    end
+    admin.exec("DROP ROLE iter_user")
+  end
+
   def test_md5_and_cleartext_roles
     omit_unless(server.ours?, "PG_TEST_URL's server: its pg_hba.conf is not ours")
     admin = conn

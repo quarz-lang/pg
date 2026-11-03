@@ -1,5 +1,5 @@
 # Connects to the server `url` names (`PG.parse_url` reads it), and
-# authenticates. Raises `PG::Error` when the server refuses (a wrong
+# authenticates. Raises `PG::ServerError` when the server refuses (a wrong
 # password, a missing database), `PG::AuthenticationError` when this
 # client cannot authenticate as the server asks, and `PG::ConnectionError`
 # when the server cannot be reached or does not answer in time.
@@ -103,14 +103,14 @@ class Connection
   end
 
   # Calls the block with each notice or warning the server sends (its
-  # fields, as `PG::Error#fields`); without a handler they are dropped.
+  # fields, as `PG::ServerError#fields`); without a handler they are dropped.
   def on_notice(&handler: (Hash[String, String]) -> Void) -> Void
     @notice_handler = handler
   end
 
   # Runs `sql` (one statement or several, separated by `;`) with the
   # simple protocol, and returns the last statement's result. Raises
-  # `PG::Error` for the first statement that fails, after which the
+  # `PG::ServerError` for the first statement that fails, after which the
   # statements after it do not run (and, outside a transaction block, the
   # ones before it stay done). Takes no parameters: use `#query` for
   # values.
@@ -150,7 +150,7 @@ class Connection
   # `$1`, `$2`, ...: each is sent apart from the SQL, so no value needs
   # quoting. A parameter may be nil (NULL), an Int, a Float, a String, a
   # Bool, Bytes (bytea), a Time (sent in UTC) or a Symbol (its name);
-  # another raises `ArgumentError`. Raises `PG::Error` when the statement
+  # another raises `ArgumentError`. Raises `PG::ServerError` when the statement
   # fails. A call cut short closes the connection, as `#exec` says.
   def query(sql: String, params: Array[Object?] = []) -> Result
     values = params.map { |p| Connection.encode(p) }
@@ -180,7 +180,7 @@ class Connection
   # returns, or ROLLBACK when it raises (the exception goes on) or leaves
   # otherwise (`return`, `break`). When a statement in the block failed
   # and the block went on after rescuing it, the server rolls the
-  # transaction back at COMMIT; this raises `PG::Error` (SQLSTATE 25P02)
+  # transaction back at COMMIT; this raises `PG::ServerError` (SQLSTATE 25P02)
   # then, rather than returning as if it had been committed. Returns the
   # block's value. Raises `PG::TransactionError` when the connection is in
   # a transaction already: there are no nested transactions (no
@@ -204,7 +204,7 @@ class Connection
       rollback_quietly unless settled
     end
     if exec("COMMIT").command_tag == "ROLLBACK"
-      raise Error.new({ "S" => "ERROR", "V" => "ERROR", "C" => "25P02",
+      raise ServerError.new({ "S" => "ERROR", "V" => "ERROR", "C" => "25P02",
                         "M" => "the transaction was aborted by an earlier error and rolled back" })
     end
     result
@@ -249,7 +249,7 @@ class Connection
   # connection.
   private def converse(request: Bytes, &handle: (Backend) -> Void) -> Void
     send(request)
-    error: Error? = nil
+    error: ServerError? = nil
     done = false
     begin
       loop do
@@ -261,7 +261,7 @@ class Connection
         end
         case m
         in Backend::ErrorResponse(fields:)
-          error = error || Error.new(fields)
+          error = error || ServerError.new(fields)
         in Backend::ReadyForQuery(status:)
           @status = status
           done = true
@@ -389,7 +389,7 @@ class Connection
   private def refused(fields: Hash[String, String]) -> Nothing
     @closed = true
     close_io
-    raise Error.new(fields)
+    raise ServerError.new(fields)
   end
 
   # A server that started SCRAM and then asks for a weaker method is not

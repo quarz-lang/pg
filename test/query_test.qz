@@ -107,22 +107,22 @@ class QueryTest < Test::Case
 
   def test_errors_leave_the_connection_usable
     c = conn
-    e = assert_raise(PG::Error) { c.exec("SELECT * FROM no_such_table") }.as(PG::Error)
+    e = assert_raise(PG::ServerError) { c.exec("SELECT * FROM no_such_table") }.as(PG::ServerError)
     assert_equal("42P01", e.code)
     assert_equal(15, e.position)
     assert_equal(1, c.exec("SELECT 1").rows[0].int(0))
-    e = assert_raise(PG::Error) { c.query("SELECT 1/$1::int", [0]) }.as(PG::Error)
+    e = assert_raise(PG::ServerError) { c.query("SELECT 1/$1::int", [0]) }.as(PG::ServerError)
     assert_equal("22012", e.code)
     assert_equal(1, c.query("SELECT $1::int", [1]).rows[0].int(0))
     c.exec("CREATE TEMP TABLE u (k int PRIMARY KEY)")
     c.query("INSERT INTO u VALUES ($1)", [1])
-    e = assert_raise(PG::Error) { c.query("INSERT INTO u VALUES ($1)", [1]) }.as(PG::Error)
+    e = assert_raise(PG::ServerError) { c.query("INSERT INTO u VALUES ($1)", [1]) }.as(PG::ServerError)
     assert_equal("23505", e.code)
     assert_equal("u_pkey", e.constraint)
     assert_match(/already exists/, e.detail || "")
     # A statement the server cancels on its own: a timeout.
     c.exec("SET statement_timeout = 50")
-    e = assert_raise(PG::Error) { c.exec("SELECT pg_sleep(5)") }.as(PG::Error)
+    e = assert_raise(PG::ServerError) { c.exec("SELECT pg_sleep(5)") }.as(PG::ServerError)
     assert_equal("57014", e.code)
     assert_equal(:idle, c.transaction_status)
   end
@@ -138,16 +138,16 @@ class QueryTest < Test::Case
       end
     end
     assert_equal(:idle, c.transaction_status)
-    e = assert_raise(PG::Error) do
+    e = assert_raise(PG::ServerError) do
       c.transaction do |tx|
         tx.query("INSERT INTO acc VALUES ($1)", [3])
         begin
           tx.exec("SELECT * FROM no_such_table")
-        rescue PG::Error
+        rescue PG::ServerError
         end
         nil
       end
-    end.as(PG::Error)
+    end.as(PG::ServerError)
     assert_equal("25P02", e.code)
     assert_equal([1], c.exec("SELECT n FROM acc").rows.map { |r| r.int(0) })
   end

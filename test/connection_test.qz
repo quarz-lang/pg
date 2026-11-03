@@ -52,9 +52,9 @@ class ConnectionTest < Test::Case
 
   def test_wrong_password
     config = PG.parse_url(server.url)
-    e = assert_raise(PG::Error) do
+    e = assert_raise(PG::ServerError) do
       PG.connect(host: config.host, port: config.port, user: config.user, password: "wrong")
-    end.as(PG::Error)
+    end.as(PG::ServerError)
     assert_equal("28P01", e.code)
     assert_equal("FATAL", e.severity)
   end
@@ -68,10 +68,10 @@ class ConnectionTest < Test::Case
 
   def test_missing_database
     config = PG.parse_url(server.url)
-    e = assert_raise(PG::Error) do
+    e = assert_raise(PG::ServerError) do
       PG.connect(host: config.host, port: config.port, user: config.user, password: config.password,
                  database: "no_such_database_here")
-    end.as(PG::Error)
+    end.as(PG::ServerError)
     assert_equal("3D000", e.code)
   end
 end
@@ -163,6 +163,15 @@ class ConnectionFailureTest < Test::Case
     assert_equal(5_000_000, PG.parse_url("postgres://h/d?max_scram_iterations=5000000").max_scram_iterations)
     assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?max_scram_iterations=0") }
     assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?max_scram_iterations=x") }
+  end
+
+  def test_every_error_is_a_pg_error
+    assert_true(PG::ServerError.new({}).is_a?(PG::Error))
+    assert_true(PG::ConnectionError.new("x").is_a?(PG::Error))
+    assert_true(PG::ProtocolError.new("x").is_a?(PG::ConnectionError))
+    assert_true(PG::AuthenticationError.new("x").is_a?(PG::ConnectionError))
+    assert_true(PG::TransactionError.new("x").is_a?(PG::Error))
+    assert_true(PG::NullError.new("x").is_a?(PG::Error))
   end
 
   def test_url_errors_hide_the_password

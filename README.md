@@ -22,10 +22,10 @@ Work in progress. What exists:
   TCP or a unix socket (a `host` starting with `/`), authentication by
   SCRAM-SHA-256 (`PG::Scram`), md5, cleartext (over a unix socket, or
   with `allow_cleartext: true`) or trust, `connect_timeout`. Server
-  errors raise `PG::Error` (SQLSTATE `code`, `detail`, `hint`, ...).
+  errors raise `PG::ServerError` (SQLSTATE `code`, `detail`, `hint`, ...).
 
-- `conn.exec(sql)` (simple protocol; several statements, the last
-  result; `exec_all` for all of them) and `conn.query(sql, params)`
+- `conn.exec(sql)` (simple protocol; several statements: the last
+  statement's result; `exec_all` returns all of them) and `conn.query(sql, params)`
   (extended protocol, `$1`... sent apart from the SQL: nil, Int, Float,
   String, Bool, Bytes, Time, Symbol), returning a `PG::Result`: columns,
   `PG::Row`s with the server's text (`row["name"]`) and typed readers
@@ -43,10 +43,12 @@ end
 conn.close
 ```
 
-Errors: `PG::Error` is what the server reported (a refused login
-included: SQLSTATE 28P01 for a wrong password); `PG::ConnectionError`
-(with `PG::AuthenticationError` and `PG::ProtocolError` under it) means
-the connection failed or cannot be used any further.
+Errors: `PG::Error` is the root of every error the cog raises.
+`PG::ServerError` is what the server reported (SQLSTATE `code`,
+`detail`, `hint`, `position`; a refused login included, 28P01 for a wrong
+password); `PG::ConnectionError` (with `PG::AuthenticationError` and
+`PG::ProtocolError` under it) means the connection failed or cannot be
+used any further; `PG::TransactionError` and `PG::NullError` are misuses.
 
 
 Next: a prepared-statement cache, a connection pool.

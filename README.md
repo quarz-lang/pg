@@ -78,6 +78,15 @@ PG::Pool.open("postgres://app@localhost/shop", size: 8) do |pool|
 end
 ```
 
+- `PG::Testing`, for the tests of a program or cog that uses pg:
+  `PG::Testing.with_cluster { |url| ... }` runs the block against
+  `PG_TEST_URL`'s server when that is set, or else a throwaway cluster
+  made with PostgreSQL's own programs (`initdb`, `pg_ctl`) in a
+  temporary directory, removed afterwards; `PG::Testing::Unavailable`
+  when there is neither. `PG::Testing.start` and `start_or_reason`
+  keep one server for a test class (`startup`/`shutdown`, omitting the
+  tests when there is none).
+
 Not yet: TLS, LISTEN/NOTIFY as an API, COPY, cancel requests.
 
 ## Differences from libpq
@@ -96,8 +105,8 @@ For now, to be revisited:
 ## Development
 
 `quarz test` runs the tests, `quarz test --doc` the documentation's
-examples. The integration tests connect to `PG_TEST_URL` when it is set;
-otherwise, where PostgreSQL's server programs are installed
-(`/usr/lib/postgresql/*/bin`), they make a throwaway cluster in a
-temporary directory (SCRAM-SHA-256, a random port on 127.0.0.1) and
-remove it afterwards; with neither, they are omitted. Licensed under MIT No Attribution (LICENSE).
+examples. The integration tests use `PG::Testing`: `PG_TEST_URL` when it
+is set; otherwise, where PostgreSQL's server programs are installed
+(`/usr/lib/postgresql/*/bin`), a throwaway cluster in a temporary
+directory (SCRAM-SHA-256, a random port on 127.0.0.1), removed
+afterwards; with neither, they are omitted. Licensed under MIT No Attribution (LICENSE).

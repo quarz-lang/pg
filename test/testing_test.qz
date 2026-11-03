@@ -1,0 +1,25 @@
+require "test"
+
+# `PG::Testing` itself: a server for a block, stopped afterwards.
+class TestingTest < Test::Case
+  def test_with_cluster
+    url = begin
+      PG::Testing.with_cluster do |u|
+        c = PG.connect(u)
+        begin
+          assert_equal("1", c.exec("SELECT 1").rows[0][0])
+        ensure
+          c.close
+        end
+        u
+      end
+    rescue PG::Testing::Unavailable => e
+      omit(e.message)
+    end
+    env = ENV["PG_TEST_URL"]?
+    unless env && !env.empty?
+      # Ours, stopped: nothing listens any more.
+      assert_raise(PG::ConnectionError) { PG.connect(url) }
+    end
+  end
+end

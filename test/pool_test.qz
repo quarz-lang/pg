@@ -1,24 +1,23 @@
 require "test"
-require_relative "server"
 
-# PG::Pool against a real server (test/server.qz).
+# PG::Pool against a real server (PG::Testing).
 class PoolTest < Test::Case
-  SERVER = Atom[TestServer | String].new("not started")
+  SERVER = Atom[PG::Testing::Server | String].new("not started")
 
   def self.startup
-    SERVER.set(TestServer.start)
+    SERVER.set(PG::Testing.start_or_reason)
   end
 
   def self.shutdown
     case SERVER.get
-    in TestServer => s then s.stop
+    in PG::Testing::Server => s then s.stop
     else nil
     end
   end
 
   def url -> String
     case SERVER.get
-    in TestServer => s then s.url
+    in PG::Testing::Server => s then s.url
     in String => why then omit(why)
     end
   end

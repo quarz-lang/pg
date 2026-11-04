@@ -110,3 +110,14 @@ is set; otherwise, where PostgreSQL's server programs are installed
 (`/usr/lib/postgresql/*/bin`), a throwaway cluster in a temporary
 directory (SCRAM-SHA-256, a random port on 127.0.0.1), removed
 afterwards; with neither, they are omitted. Licensed under MIT No Attribution (LICENSE).
+
+To develop another cog against a local checkout of pg, write
+`Cog.local.toml` beside that cog's `Cog.toml` (git should ignore it;
+`quarz cog init` lists it in `.gitignore`):
+
+```toml
+[patch]
+PG = { path = "../quarz-pg" }
+```
+
+That cog's lock ignores the file: it keeps pg's git source.

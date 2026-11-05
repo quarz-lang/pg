@@ -28,8 +28,9 @@ directory, removed in the test class's shutdown); with neither they are
 omitted with a message.
 
 - Work on a branch and open a pull request (below); stage files by explicit path.
-- Review every commit with a fresh subagent given the diff, and fix what
-  it finds that needs no decision.
+- Review the branch's diff with a fresh subagent before the pull request
+  leaves draft (commits on a draft are fine without it), and fix what it
+  finds that needs no decision.
 - Never print secrets (passwords, tokens).
 - Do not put a `Claude-Session:` line in commit messages, nor a Claude
   session URL in pull request descriptions.
@@ -40,6 +41,7 @@ omitted with a message.
   while the local checks run: CI then runs in parallel with `quarz test`.
 - While it is a draft, force-pushing after the subagent review or the
   local checks changed the commits is fine (amend or rebase as needed).
-- Mark it ready for review only when the subagent review and every local
-  check above have passed; from then on add commits, never force-push.
+- Mark it ready for review only when the subagent review of the branch's
+  diff and every local check above have passed; from then on add
+  commits, never force-push, and review each of them before pushing.
 - The description says what was verified.

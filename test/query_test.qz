@@ -71,7 +71,7 @@ class QueryTest < Test::Case
     assert_equal(b"\x00\xff", row.bytes(4))
     assert_true(row.bool(5))
     assert_equal("sym", row.string(6))
-    assert_raise(ArgumentError) { c.query("SELECT $1", [[1]]) }
+    assert_raise(ArgumentError) { c.query("SELECT $1", [1.seconds]) }
   end
 
   def test_types_round_trip
@@ -343,5 +343,86 @@ class QueryTest < Test::Case
                    database: "postgres", allow_cleartext: true)
     assert_equal("clear_user", c.exec("SELECT current_user").rows[0].string(0))
     c.close
+  end
+
+  # An array is one parameter, whatever its length: one prepared
+  # statement serves them all, with no limit of 65535 parameters.
+  def test_array_parameters
+    c = conn
+    c.exec("CREATE TEMP TABLE many (id bigint PRIMARY KEY, name text)")
+    c.exec("INSERT INTO many SELECT i, 'n' || i FROM generate_series(1, 70000) AS i")
+    sql = "SELECT count(*) FROM many WHERE id = ANY($1)"
+    assert_equal(0, c.query(sql, [Array[Int].new]).rows[0].int(0))
+    assert_equal(1, c.query(sql, [[5]]).rows[0].int(0))
+    assert_equal(3, c.query(sql, [[1, 2, 3]]).rows[0].int(0))
+    ids = (1..70000).to_a
+    assert_equal(70000, c.query(sql, [ids]).rows[0].int(0))
+    # A nil element is NULL, which `= ANY` never finds.
+    assert_equal(2, c.query(sql, [[1, nil, 2]]).rows[0].int(0))
+    # (One for the typed arrays, one for the empty one, which has no type
+    # to give and is inferred from `id`.)
+    assert_equal(2, c.query("SELECT count(*) FROM pg_prepared_statements WHERE statement = $1", [sql]).rows[0].int(0))
+    # Typed, `unnest($1)` needs no cast; an empty array has no type to
+    # give (OID 0): it needs one.
+    un: Array[Int?] = [3, nil, 1]
+    assert_equal(un, c.query("SELECT unnest($1) AS x", [[3, nil, 1]]).rows.map { |r| r.int?(0) })
+    assert_equal(0, c.query("SELECT count(*) FROM unnest($1::bigint[])", [Array[Int].new]).rows[0].int(0))
+    assert_raise(PG::ServerError) { c.query("SELECT unnest($1)", [Array[Int].new]) }
+    assert_equal(["n1", "n70000"], c.query("SELECT name FROM many WHERE name = ANY($1) ORDER BY id", [["n1", "n70000", "x"]]).rows.map { |r| r.string(0) })
+    # Untyped (Float, String, Time), a bare `unnest($1)` needs a cast.
+    assert_raise(PG::ServerError) { c.query("SELECT unnest($1)", [["a"]]) }
+    assert_equal(["a"], c.query("SELECT unnest($1::text[])", [["a"]]).rows.map { |r| r.string(0) })
+  end
+
+  # Arrays of Floats, Strings and Times are untyped, as their scalars
+  # are: the column decides.
+  def test_untyped_arrays_meet_the_column
+    c = conn
+    c.exec("CREATE TEMP TABLE kinds (u uuid, d date, n numeric, r real, ts timestamp)")
+    c.exec("INSERT INTO kinds VALUES ('00000000-0000-0000-0000-000000000001', '2024-03-05', 0.30000000000000004, 0.1, '2024-03-05 14:07:09')")
+    count = ->(sql: String, p: Object?) { c.query("SELECT count(*) FROM kinds WHERE #{sql}", [p]).rows[0].int(0) }
+    assert_equal(1, count.call("u = ANY($1)", ["00000000-0000-0000-0000-000000000001"]))
+    assert_equal(1, count.call("d = ANY($1)", ["2024-03-05"]))
+    assert_equal(1, count.call("n = ANY($1)", [0.30000000000000004]))
+    assert_equal(1, count.call("r = ANY($1)", [0.1]))
+    # A `timestamp` column keeps the instant sent in UTC, whatever the
+    # session's time zone, as a scalar Time does.
+    c.exec("SET TimeZone = 'Asia/Tokyo'")
+    t = Time.utc(2024, 3, 5, 14, 7, 9)
+    assert_equal(1, count.call("ts = ANY($1)", [t]))
+    assert_equal(1, count.call("ts = $1", t))
+    c.query("INSERT INTO kinds (ts) SELECT unnest($1::timestamp[])", [[t]])
+    assert_equal(2, count.call("ts = ANY($1)", [t]))
+  end
+
+  # (One SQL text, `SELECT $1 AS a`, with arrays of each typed kind: a
+  # statement for each.)
+  def test_array_round_trips
+    c = conn
+    texts: Array[String?] = ["b,c", "d\"e", "f\\g", "", "NULL", nil, "h i", "{j}", "日本"]
+    assert_equal(texts, c.query("SELECT $1::text[] AS a", [texts]).rows[0].strings("a"))
+    ints: Array[Int?] = [1, nil, -9223372036854775808]
+    assert_equal(ints, c.query("SELECT $1 AS a", [ints]).rows[0].ints("a"))
+    floats: Array[Float?] = [1.5, nil, -0.25]
+    assert_equal(floats, c.query("SELECT $1::float8[] AS a", [floats]).rows[0].floats("a"))
+    bools: Array[Bool?] = [true, nil, false]
+    assert_equal(bools, c.query("SELECT $1 AS a", [bools]).rows[0].bools("a"))
+    t1 = Time.utc(2024, 3, 5, 14, 7, 9)
+    t2 = Time.utc(1999, 12, 31, 23, 59, 59)
+    times: Array[Time?] = [t1, nil, t2]
+    got = c.query("SELECT $1::timestamptz[] AS a", [times]).rows[0].times("a")
+    secs: Array[Int?] = [t1.to_i, nil, t2.to_i]
+    assert_equal(secs, got.map { |t| t ? t.to_i : nil })
+    assert_equal(["boolean[]"], c.query("SELECT pg_typeof($1)::text", [[true]]).rows.map { |r| r.string(0) })
+    # Bytes are sent as bytea[]; read back as text.
+    hex: Array[String?] = ["\\x01ff"]
+    assert_equal(hex, c.query("SELECT $1 AS a", [[b"\x01\xff"]]).rows[0].strings("a"))
+    # A NULL array, and an empty one.
+    row = c.exec("SELECT NULL::int8[] AS n, '{}'::int8[] AS e, ARRAY[[1,2],[3,4]] AS m").rows[0]
+    assert_nil(row.ints?("n"))
+    assert_raise(PG::NullError) { row.ints("n") }
+    assert_equal(Array[Int?].new, row.ints("e"))
+    assert_raise(ArgumentError) { row.ints("m") }
+    assert_equal("{{1,2},{3,4}}", row["m"])
   end
 end

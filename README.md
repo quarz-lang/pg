@@ -27,11 +27,37 @@ Work in progress. What exists:
 - `conn.exec(sql)` (simple protocol; several statements: the last
   statement's result; `exec_all` returns all of them) and `conn.query(sql, params)`
   (extended protocol, `$1`... sent apart from the SQL: nil, Int, Float,
-  String, Bool, Bytes, Time, Symbol), returning a `PG::Result`: columns,
-  `PG::Row`s with the server's text (`row["name"]`) and typed readers
-  (`int`, `float`, `string`, `bool`, `bytes`, `time`, each with a `?`
-  form for NULL), `command_tag`, `affected`. After an error the
-  connection stays usable.
+  String, Bool, Bytes, Time, Symbol, or an `Array` of one of them),
+  returning a `PG::Result`: columns, `PG::Row`s with the server's text
+  (`row["name"]`) and typed readers (`int`, `float`, `string`, `bool`,
+  `bytes`, `time`, each with a `?` form for NULL; for arrays `ints`,
+  `floats`, `strings`, `bools`, `times`), `command_tag`, `affected`.
+  After an error the connection stays usable.
+- Arrays. An `Array` parameter is one parameter, a one-dimensional
+  PostgreSQL array in text format (`{1,2,3}`, `{"b,c",NULL}`), however
+  long: `WHERE id = ANY($1)` with 70,000 ids is one parameter and one
+  prepared statement, not 70,000 (the protocol's limit is 65535
+  parameters). Its elements are of one class (`ArgumentError` for mixed
+  classes or a nested array) and nil is NULL. Its type:
+
+  | Elements | Sent as | A bare `unnest($1)`, `SELECT $1` |
+  |---|---|---|
+  | Int | `int8[]` | needs no cast |
+  | Bool | `bool[]` | needs no cast |
+  | Bytes | `bytea[]` | needs no cast |
+  | Float, String, Symbol, Time | untyped, as their scalars | needs one: `$1::text[]` |
+  | none (empty, or nils only) | untyped | needs one: `$1::bigint[]` |
+
+  Untyped, the server infers the type from the context, so that the
+  column decides, as for a scalar: `= ANY($1)` beside a `uuid`, `date`,
+  enum, `citext`, `numeric`, `real` or `timestamp` column compares as
+  that column does (typed, a `text[]` would not meet a `uuid` column and
+  a `timestamptz[]` would shift a `timestamp` column's values by the
+  session's time zone). Scalar parameters are untyped, as before. The
+  array readers return
+  `Array[T?]` (NULL elements as nil), with a `?` form for a NULL array;
+  an array of more than one dimension raises `ArgumentError` (`row[...]`
+  gives its text).
 - `conn.transaction { |c| ... }`: BEGIN, then COMMIT, or ROLLBACK when
   the block raises; `on_notice { |fields| ... }`.
 
@@ -51,7 +77,10 @@ password); `PG::ConnectionError` (with `PG::AuthenticationError` and
 used any further; `PG::TransactionError` and `PG::NullError` are misuses.
 
 
-- `query` prepares each SQL text once and keeps the
+- `query` prepares each SQL text once per element types of its array
+  parameters (Parse fixes the parameters' types; their lengths do not
+  matter, so one statement serves every length; an `= ANY($1)` used
+  with both empty and non-empty arrays holds two) and keeps the
   `statement_cache_size` (default 100; 0 for a pooler in transaction
   mode) most recently used statements; one the server no longer has
   (26000) or says changed under it (0A000, outside a transaction) is

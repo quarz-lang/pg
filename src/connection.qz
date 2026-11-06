@@ -229,14 +229,19 @@ class Connection
 
   private def run_query(sql: String, params: Array[Object?], again: Bool) -> Result
     values = params.map { |p| Connection.encode(p) }
+    types = Connection.types(params)
+    # (A statement is prepared with its parameters' types: the array
+    # types are part of its key, so that `SELECT $1` given a `text[]`
+    # and then a `timestamptz[]` are two statements. Lengths are not.)
+    key = types.empty? ? sql : "#{sql}\x00#{types.join(",")}"
     columns: Array[Field] = []
     rows: Array[Row] = []
     tag = ""
-    cached = @statements.enabled? ? @statements.lookup(sql) : nil
+    cached = @statements.enabled? ? @statements.lookup(key) : nil
     name = cached || (@statements.enabled? ? @statements.next_name : "")
     # The messages that may raise (a NUL in the SQL, too many parameters)
     # are made before the cache gives up the statements it evicts.
-    body = (cached ? Bytes.new : Frontend.parse(name, sql)) + Frontend.bind("", name, values) +
+    body = (cached ? Bytes.new : Frontend.parse(name, sql, types)) + Frontend.bind("", name, values) +
            Frontend.describe_portal("") + Frontend.execute("") + Frontend.sync
     @statements.make_room if @statements.enabled? && !cached
     b = Bytes::Builder.new
@@ -264,10 +269,10 @@ class Connection
       if cached
         stale = case e.code
                 when "26000"
-                  @statements.drop(sql)
+                  @statements.drop(key)
                   true
                 when "0A000"
-                  @statements.forget(sql)
+                  @statements.forget(key)
                   @status == "I"
                 else
                   false
@@ -278,7 +283,7 @@ class Connection
     ensure
       # Prepared on the server, whatever came after (an execution error, a
       # notice handler's exception): the statement stays good.
-      @statements.add(sql, name) if !cached && parsed && name != ""
+      @statements.add(key, name) if !cached && parsed && name != ""
     end
     # The server dropped every prepared statement.
     @statements.clear if tag == "DISCARD ALL" || tag == "DEALLOCATE ALL"
@@ -324,16 +329,19 @@ class Connection
 
   # A parameter's text, as the server reads it (nil for NULL). A Time is
   # sent in UTC, so that a `timestamp` column (without zone), which drops
-  # the offset, keeps the instant as `PG::Row#time` reads it back.
+  # the offset, keeps the instant as `PG::Row#time` reads it back. An
+  # `Array` is a one-dimensional PostgreSQL array (`encode_array`).
   #
   # ```
   # PG::Connection.encode(true)                # => b"t"
   # PG::Connection.encode(b"\x01\xff")       # => b"\\x01ff"
   # PG::Connection.encode(-Float::INFINITY)    # => b"-Infinity"
+  # PG::Connection.encode([1, nil, 3])         # => b"{1,NULL,3}"
   # ```
   def self.encode(value: Object?) -> Bytes?
     text = case value
            in nil then return nil
+           in Array => xs then return encode_array(xs)
            in Bool => b then b ? "t" : "f"
            in Int => i then i.to_s
            in Float => f
@@ -349,9 +357,107 @@ class Connection
            in Bytes => b then return "\\x#{b.hex}".to_bytes
            in Time => t then t.utc.iso8601(6)
            else raise ArgumentError.new("a parameter of class #{value.class.name}: " +
-                                        "give nil, Int, Float, String, Bool, Bytes, Time or Symbol")
+                                        "give nil, Int, Float, String, Bool, Bytes, Time, Symbol or an Array of one of them")
            end
     text.to_bytes
+  end
+
+  # An array parameter's text: `{1,2,3}`, each element as `encode` gives
+  # it, double-quoted when it is empty, spells NULL or holds `,`, `{`,
+  # `}`, `"`, `\` or white space (`"` and `\` escaped with `\`); a nil
+  # element is NULL, the empty array `{}`. Raises `ArgumentError` for
+  # elements of different classes or a nested array (one dimension for
+  # now).
+  #
+  # ```
+  # PG::Connection.encode_array(["a", "b,c", "d\"e", ""])   # => b"{a,\"b,c\",\"d\\\"e\",\"\"}"
+  # PG::Connection.encode_array(Array[Int].new)            # => b"{}"
+  # ```
+  def self.encode_array(xs: Array[Object?]) -> Bytes
+    element_class(xs)
+    b = Bytes::Builder.new
+    b << "{"
+    xs.each_with_index do |x, i|
+      b << "," if i > 0
+      if t = encode(x)
+        if quote?(t)
+          b << "\""
+          t.each { |c| b << 92 if c == 34 || c == 92; b << c }
+          b << "\""
+        else
+          b << t
+        end
+      else
+        b << "NULL"
+      end
+    end
+    b << "}"
+    b.to_bytes
+  end
+
+  # The class of an array parameter's elements, nil when it has none but
+  # nils; `ArgumentError` for mixed classes or a nested array.
+  def self.element_class(xs: Array[Object?]) -> Type[Object]?
+    first: Type[Object]? = nil
+    at = 0
+    xs.each_with_index do |x, i|
+      case x
+      in nil then nil
+      in Array then raise ArgumentError.new("a nested array at index #{i}: array parameters are one-dimensional")
+      else
+        if f = first
+          unless x.class == f
+            raise ArgumentError.new("an array parameter of mixed classes: index #{at} is a #{f.name}, index #{i} a #{x.class.name}")
+          end
+        else
+          first = x.class
+          at = i
+        end
+      end
+      nil
+    end
+    first
+  end
+
+  # The type OIDs the Parse message gives for `params`, up to the last
+  # one that is not 0: the array's type for an array of Ints (`int8[]`
+  # 1016), Bools (`bool[]` 1000) or Bytes (`bytea[]` 1001), so that a
+  # bare `unnest($1)` resolves without a cast; 0 for the rest, as for
+  # every scalar: the server infers the type from the context, so that
+  # the column decides (a `float8[]` would compare a `numeric` or `real`
+  # column as double precision, a `text[]` would not meet a `uuid`,
+  # `date`, enum or `citext` column, a `timestamptz[]` would shift a
+  # `timestamp` column's values by the session's time zone). An empty
+  # array or one of nils is 0 too.
+  #
+  # ```
+  # PG::Connection.types([1, [1, 2], "a"])   # => [0, 1016]
+  # PG::Connection.types([Array[Int].new])   # => []
+  # ```
+  def self.types(params: Array[Object?]) -> Array[Int]
+    oids = params.map do |p|
+      case p
+      in Array => xs
+        c = element_class(xs)
+        if c == Int then 1016
+        elsif c == Bool then 1000
+        elsif c == Bytes then 1001
+        else 0
+        end
+      else 0
+      end
+    end
+    n = oids.size
+    n -= 1 while n > 0 && oids[n - 1] == 0
+    oids.take(n)
+  end
+
+  # The bytes that make an array element quoted.
+  QUOTED = [b",", b"{", b"}", b"\"", b"\\", b" ", b"\t", b"\n", b"\v", b"\f", b"\r"]
+
+  private def self.quote?(t: Bytes) -> Bool
+    return true if t.empty? || (t.size == 4 && t.decode.downcase == "null")
+    QUOTED.any? { |c| t.include?(c) }
   end
 
   # Sends `request` and reads the answer up to ReadyForQuery, giving the

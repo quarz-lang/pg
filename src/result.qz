@@ -141,6 +141,46 @@ class Row
     (t = text(column)) ? Row.parse_time(t) : nil
   end
 
+  # The column's array as Ints (a NULL element as nil). Raises
+  # `ArgumentError` for an array of more than one dimension, as the
+  # readers do for text that is not their type.
+  def ints(column: Int | String) -> Array[Int?] = ints?(column) || null(column)
+
+  # As `#ints`, nil for a NULL array.
+  def ints?(column: Int | String) -> Array[Int?]? = elements?(column) { |t| Row.parse_int(t) }
+
+  # The column's array as Floats.
+  def floats(column: Int | String) -> Array[Float?] = floats?(column) || null(column)
+
+  # As `#floats`, nil for a NULL array.
+  def floats?(column: Int | String) -> Array[Float?]? = elements?(column) { |t| Row.parse_float(t) }
+
+  # The column's array as text.
+  def strings(column: Int | String) -> Array[String?] = strings?(column) || null(column)
+
+  # As `#strings`, nil for a NULL array.
+  def strings?(column: Int | String) -> Array[String?]? = elements?(column) { |t| t }
+
+  # The column's array as Bools.
+  def bools(column: Int | String) -> Array[Bool?] = bools?(column) || null(column)
+
+  # As `#bools`, nil for a NULL array.
+  def bools?(column: Int | String) -> Array[Bool?]?
+    elements?(column) do |t|
+      case t
+      in "t" then true
+      in "f" then false
+      else raise ArgumentError.new("not a bool: #{t.inspect}")
+      end
+    end
+  end
+
+  # The column's array as Times.
+  def times(column: Int | String) -> Array[Time?] = times?(column) || null(column)
+
+  # As `#times`, nil for a NULL array.
+  def times?(column: Int | String) -> Array[Time?]? = elements?(column) { |t| Row.parse_time(t) }
+
   # The row as a hash from column names to text values.
   def to_h -> Hash[String, String?]
     h: Hash[String, String?] = {}
@@ -170,6 +210,63 @@ class Row
       raise ArgumentError.new("not a number: #{text.inspect}") unless text.match?(/\A-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?\z/)
       text.to_f
     end
+  end
+
+  # An array's text output (`{1,NULL,"a b"}`) as its elements' text, nil
+  # for NULL: quoted elements unescaped. Elements are separated by `,`,
+  # as for every built-in type but `box` (whose arrays use `;`). Raises `ArgumentError` for an
+  # array of more than one dimension or with explicit bounds
+  # (`[0:1]={1,2}`).
+  #
+  # ```
+  # PG::Row.parse_array(b"{1,NULL,\"a,\\\"b\"}")   # => ["1", nil, "a,\"b"]
+  # PG::Row.parse_array(b"{}")                     # => []
+  # ```
+  def self.parse_array(raw: Bytes) -> Array[String?]
+    n = raw.size
+    raise ArgumentError.new("an array with explicit bounds: #{raw.decode.inspect}") if n > 0 && raw[0] == 91
+    raise ArgumentError.new("not an array: #{raw.decode.inspect}") unless n >= 2 && raw[0] == 123 && raw[n - 1] == 125
+    out = Array::Builder[String?].new
+    return out.to_a if n == 2
+    i = 1
+    # (The next backslash and quote, each searched again only once
+    # passed.)
+    bs = raw.index(b"\\", 0) || n
+    q = -1
+    loop do
+      raise ArgumentError.new("malformed array: #{raw.decode.inspect}") if i >= n - 1
+      raise ArgumentError.new("an array of more than one dimension: read it with `[]`") if raw[i] == 123
+      if raw[i] == 34
+        b = Bytes::Builder.new
+        i += 1
+        loop do
+          q = raw.index(b"\"", i) || n if q < i
+          raise ArgumentError.new("an unterminated quoted element: #{raw.decode.inspect}") unless q < n - 1
+          bs = raw.index(b"\\", i) || n if bs < i
+          if bs < q
+            b << raw.slice(i, bs - i)
+            b << raw[bs + 1]
+            i = bs + 2
+          else
+            b << raw.slice(i, q - i)
+            i = q + 1
+            break
+          end
+        end
+        out << b.to_bytes.decode
+      else
+        start = i
+        i = raw.index(b",", i) || n - 1
+        i = n - 1 if i > n - 1
+        raise ArgumentError.new("malformed array: #{raw.decode.inspect}") if i == start
+        t = raw.slice(start, i - start).decode
+        out << (i - start == 4 && t == "NULL" ? nil : t)
+      end
+      break if i >= n - 1
+      raise ArgumentError.new("malformed array: #{raw.decode.inspect}") unless raw[i] == 44
+      i += 1
+    end
+    out.to_a
   end
 
   # bytea's hex output (`\x0aff`) as Bytes.
@@ -228,6 +325,11 @@ class Row
   private def raw(column: Int | String) -> Bytes? = @values[index(column)]
 
   private def text(column: Int | String) -> String? = raw(column)&.decode
+
+  private def elements?[T](column: Int | String, &f: (String) -> T) -> Array[T?]?
+    v = raw(column) || return nil
+    Row.parse_array(v).map { |x| x ? f.call(x) : nil }
+  end
 
   private def type_of(column: Int | String) -> Int = @columns[index(column)].type
 

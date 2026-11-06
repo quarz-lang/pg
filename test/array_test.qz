@@ -1,0 +1,79 @@
+require "test"
+
+# Array parameters and array results, without a server.
+class ArrayTest < Test::Case
+  def enc(xs: Array[Object?]) -> String = PG::Connection.encode(xs).as(Bytes).decode
+
+  def test_encoding_of_each_class
+    assert_equal("{1,-2,3}", enc([1, -2, 3]))
+    assert_equal("{1.5,NaN,-Infinity}", enc([1.5, Float::NAN, -Float::INFINITY]))
+    assert_equal("{a,b}", enc(["a", "b"]))
+    assert_equal("{a,b}", enc([:a, :b]))
+    assert_equal("{t,f}", enc([true, false]))
+    t = Time.utc(2024, 3, 5, 14, 7, 9)
+    assert_equal("{2024-03-05T14:07:09.000000Z}", enc([t]))
+    assert_equal("{\"\\\\x01ff\"}", enc([b"\x01\xff"]))
+  end
+
+  def test_quoting_and_escaping
+    assert_equal("{\"b,c\",\"d\\\"e\",\"f\\\\g\",\"\",\"NULL\",\"null\",\"h i\",\"{j}\",\"k\tl\"}",
+                 enc(["b,c", "d\"e", "f\\g", "", "NULL", "null", "h i", "{j}", "k\tl"]))
+    assert_equal("{é,日本}", enc(["é", "日本"]))
+  end
+
+  def test_nils_and_the_empty_array
+    assert_equal("{1,NULL,3}", enc([1, nil, 3]))
+    assert_equal("{NULL}", enc([nil]))
+    assert_equal("{}", enc(Array[Int].new))
+  end
+
+  def test_mixed_and_nested_refused
+    e = assert_raise(ArgumentError) { enc([1, "a"]) }
+    assert_match(/index 0 is a Int, index 1 a String/, e.message)
+    e = assert_raise(ArgumentError) { enc([nil, 1, 2.5]) }
+    assert_match(/index 1 is a Int, index 2 a Float/, e.message)
+    nested: Array[Object?] = [[1], [2]]
+    e = assert_raise(ArgumentError) { enc(nested) }
+    assert_match(/a nested array at index 0/, e.message)
+    e = assert_raise(ArgumentError) { enc([1.seconds]) }
+    assert_match(/a parameter of class Duration/, e.message)
+  end
+
+  def test_types
+    assert_equal([0, 1016, 0, 0, 0, 1000, 0, 1001],
+                 PG::Connection.types([1, [1], [1.5], ["a"], [:a], [true], [Time.utc(2024, 1, 1)], [b"x"]]))
+    assert_equal(Array[Int].new, PG::Connection.types([[1.5], ["a"], [Time.utc(2024, 1, 1)]]))
+    assert_equal(Array[Int].new, PG::Connection.types([1, "a", nil]))
+    assert_equal(Array[Int].new, PG::Connection.types([Array[Int].new]))
+    assert_equal([0, 1016], PG::Connection.types([[nil], [nil, 2]]))
+  end
+
+  def test_decoding
+    assert_equal(Array[String?].new, PG::Row.parse_array(b"{}"))
+    w1: Array[String?] = ["1", nil, "3"]
+    assert_equal(w1, PG::Row.parse_array(b"{1,NULL,3}"))
+    w2: Array[String?] = ["b,c", "d\"e", "f\\g", "", "NULL", "h i"]
+    assert_equal(w2,
+                 PG::Row.parse_array(b"{\"b,c\",\"d\\\"e\",\"f\\\\g\",\"\",\"NULL\",\"h i\"}"))
+    e = assert_raise(ArgumentError) { PG::Row.parse_array(b"{{1,2},{3,4}}") }
+    assert_match(/more than one dimension/, e.message)
+    assert_raise(ArgumentError) { PG::Row.parse_array(b"[0:1]={1,2}") }
+    assert_raise(ArgumentError) { PG::Row.parse_array(b"{\"a}") }
+    assert_raise(ArgumentError) { PG::Row.parse_array(b"1,2") }
+    assert_raise(ArgumentError) { PG::Row.parse_array(b"{1,}") }
+    assert_raise(ArgumentError) { PG::Row.parse_array(b"{,1}") }
+    w3: Array[String?] = ["a\\", "\"", "x"]
+    assert_equal(w3, PG::Row.parse_array(b"{\"a\\\\\",\"\\\"\",x}"))
+  end
+
+  def test_round_trip
+    # (Linear in the escapes of one element too.)
+    slashes = "\\" * 40000
+    one: Array[String?] = [slashes]
+    assert_equal(one, PG::Row.parse_array(PG::Connection.encode([slashes]).as(Bytes)))
+    big = (1..70000).to_a
+    assert_equal(big.map(&:to_s), PG::Row.parse_array(PG::Connection.encode(big).as(Bytes)).map { |x| x.as(String) })
+    xs: Array[String?] = ["b,c", "d\"e", "f\\g", "", "NULL", "h i", "{j}", "é"]
+    assert_equal(xs, PG::Row.parse_array(PG::Connection.encode(xs).as(Bytes)))
+  end
+end

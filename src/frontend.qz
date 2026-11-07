@@ -4,6 +4,17 @@ module Frontend
   # Protocol 3.0, as the startup message names it.
   PROTOCOL = 196608
 
+  # The code an SSLRequest sends in place of a protocol version.
+  SSL_REQUEST = 80877103
+
+  # The SSLRequest: asks the server, before the startup message, whether
+  # it speaks TLS; it answers one byte, `S` or `N`.
+  #
+  # ```
+  # PG::Frontend.ssl_request.hex   # => "0000000804d2162f"
+  # ```
+  def self.ssl_request -> Bytes = Wire.frame(nil, Wire.int32(Bytes::Builder.new, SSL_REQUEST).to_bytes)
+
   # The startup message: the protocol version and the parameters
   # (`user` is required; `database`, `client_encoding`,
   # `application_name`, ...), in the order given.

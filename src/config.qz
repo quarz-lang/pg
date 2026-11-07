@@ -18,7 +18,16 @@ data Config = (
   max_scram_iterations: Int,
   # How many prepared statements `PG::Connection#query` keeps (0: none,
   # as a pooler in transaction mode needs).
-  statement_cache_size: Int
+  statement_cache_size: Int,
+  # Whether and how TLS is used over TCP: `:disable`, `:allow`,
+  # `:prefer`, `:require`, `:verify_ca` or `:verify_full` (`PG.connect`
+  # says what each does). A unix socket never uses TLS.
+  sslmode: Symbol,
+  # The roots the server's certificate is verified against: a PEM file's
+  # path, or `system` for the system's store (nil: `~/.postgresql/root.crt`
+  # when it exists; without roots, only `:verify_ca` and `:verify_full`
+  # fail, the others go unverified).
+  sslrootcert: String?
 )
 
 # Reads a connection URL, as libpq does:
@@ -27,16 +36,26 @@ data Config = (
 # socket directory (`%2Fvar%2Frun%2Fpostgresql`, or `?host=/var/run/...`);
 # the parameters `host`, `port`, `user`, `password`, `dbname`,
 # `application_name`, `connect_timeout` (seconds), `max_scram_iterations`,
-# `statement_cache_size` and `sslmode` are read. `sslmode` may be `disable`, `allow` or `prefer` (this client has
-# no TLS yet, so they all mean a plain connection); anything stronger
-# raises `ArgumentError`, as does a malformed URL.
+# `statement_cache_size`, `sslmode` (`disable`, `allow`, `prefer`, the
+# default, `require`, `verify-ca` or `verify-full`: see `PG.connect`) and
+# `sslrootcert` (a PEM file's path, or `system`, which makes `sslmode`
+# `verify-full` unless given, and refuses a weaker one) are read.
+# `channel_binding` may be `disable` or `prefer` (no channel binding
+# either way) and `sslnegotiation` `postgres`.
+# Client certificates (`sslcert`, `sslkey`, `sslpassword`), `sslcrl`
+# and `channel_binding=require` are not supported: they raise
+# `ArgumentError`, as does a malformed URL or an unknown parameter.
 #
 # ```
 # c = PG.parse_url("postgres://ann:s%40cret@db.example:6543/shop?application_name=web")
 # [c.host, c.port, c.user, c.password, c.database, c.application_name]
 # # => ["db.example", 6543, "ann", "s@cret", "shop", "web"]
 # PG.parse_url("postgres://ann@%2Ftmp/shop").host   # => "/tmp"
-# PG.parse_url("postgres://h/d?sslmode=require")    # raises ArgumentError
+# PG.parse_url("postgres://h/d?sslmode=verify-full").sslmode   # => :verify_full
+# PG.parse_url("postgres://h/d").sslmode                       # => :prefer
+# PG.parse_url("postgres://h/d?sslrootcert=system").sslmode    # => :verify_full
+# PG.parse_url("postgres://h/d?sslrootcert=system&sslmode=require")  # raises ArgumentError
+# PG.parse_url("postgres://h/d?sslcert=client.pem")  # raises ArgumentError
 # ```
 public def parse_url(url: String) -> Config
   m = url.match(/\Apostgres(?:ql)?:\/\/(?:([^@\/?#]*)@)?(\[[^\]\/]*\]|[^:\/?#]*)(?::([0-9]*))?(?:\/([^?#]*))?(?:\?([^#]*))?\z/)
@@ -58,6 +77,8 @@ public def parse_url(url: String) -> Config
   connect_timeout: Duration? = nil
   max_scram_iterations = Scram::MAX_ITERATIONS
   statement_cache_size = Connection::STATEMENT_CACHE_SIZE
+  sslmode: Symbol? = nil
+  sslrootcert: String? = nil
   (m[5] || "").split("&").each do |pair|
     next if pair.empty?
     key, _, value = pair.partition("=")
@@ -78,10 +99,22 @@ public def parse_url(url: String) -> Config
     when "statement_cache_size"
       raise ArgumentError.new("statement_cache_size: #{value.inspect}") unless value.match?(/\A[0-9]{1,6}\z/)
       statement_cache_size = value.to_i
-    when "sslmode"
-      unless ["disable", "allow", "prefer"].include?(value)
-        raise ArgumentError.new("sslmode=#{value}: this client has no TLS yet")
+    when "sslmode" then sslmode = Config.sslmode(value)
+    when "sslrootcert"
+      raise ArgumentError.new("sslrootcert: empty") if value.empty?
+      sslrootcert = value
+    when "channel_binding"
+      unless value == "disable" || value == "prefer"
+        raise ArgumentError.new("channel_binding=#{value}: this client has no channel binding (disable or prefer only)")
       end
+    when "sslnegotiation"
+      unless value == "postgres"
+        raise ArgumentError.new("sslnegotiation=#{value}: this client negotiates TLS the postgres way only")
+      end
+    when "sslcert", "sslkey", "sslpassword"
+      raise ArgumentError.new("#{key}: this client has no client certificates")
+    when "sslcrl", "sslcrldir"
+      raise ArgumentError.new("#{key}: this client does not check revocation lists")
     else
       raise ArgumentError.new("unknown connection parameter #{key.inspect}")
     end
@@ -90,7 +123,8 @@ public def parse_url(url: String) -> Config
              user: user || Config.default_user, password: password, database: database,
              application_name: application_name, allow_cleartext: false,
              connect_timeout: connect_timeout, max_scram_iterations: max_scram_iterations,
-             statement_cache_size: statement_cache_size)
+             statement_cache_size: statement_cache_size,
+             sslmode: Config.sslmode(sslmode, sslrootcert), sslrootcert: sslrootcert)
 end
 
 extension Config
@@ -118,6 +152,32 @@ extension Config
       end
     end
     b.to_bytes.decode? || raise(ArgumentError.new("a %-escape that is not UTF-8 in a connection URL"))
+  end
+
+  # The `sslmode` a URL spells (`verify-full`), as a Symbol
+  # (`:verify_full`). Raises `ArgumentError` for another value.
+  def self.sslmode(text: String) -> Symbol
+    mode = text.tr("-", "_").to_sym
+    raise ArgumentError.new("sslmode: #{text.inspect}") unless sslmode?(mode) && !text.include?("_")
+    mode
+  end
+
+  # The `sslmode` of a connection given `mode` (nil: none given) and
+  # `rootcert`: `:prefer` by default, `:verify_full` with the system's
+  # roots, with which a weaker mode raises `ArgumentError` (libpq 16).
+  def self.sslmode(mode: Symbol?, rootcert: String?) -> Symbol
+    return mode || :prefer unless rootcert == "system"
+    m = mode || :verify_full
+    unless m == :verify_ca || m == :verify_full
+      raise ArgumentError.new("sslmode #{m} with sslrootcert=system: the system's roots need verify-full")
+    end
+    m
+  end
+
+  # Whether `mode` is a value of `sslmode`: `:disable`, `:allow`,
+  # `:prefer`, `:require`, `:verify_ca` or `:verify_full`.
+  def self.sslmode?(mode: Symbol) -> Bool
+    [:disable, :allow, :prefer, :require, :verify_ca, :verify_full].include?(mode)
   end
 
   # A port number, 1 to 65535.

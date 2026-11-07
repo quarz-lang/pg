@@ -90,12 +90,22 @@ module Testing
   # SCRAM-SHA-256 for every connection (`hba` does nothing to
   # PG_TEST_URL's server: check `Server#ours?` before relying on it).
   # Raises `Unavailable` when there is neither.
-  def self.start(*, hba: Array[String] = []) -> Server
-    if (env = ENV["PG_TEST_URL"]?) && !env.empty?
+  #
+  # Given a `certificate` (PEM, the server's own first) and its
+  # `private_key` (PEM), it is always a new cluster, with TLS on (`ssl =
+  # on`, those files as `ssl_cert_file` and `ssl_key_file`): PG_TEST_URL's
+  # server is not used, and a `hostssl` line in `hba` takes effect.
+  def self.start(*, hba: Array[String] = [], certificate: String? = nil, private_key: String? = nil) -> Server
+    if certificate.nil? != private_key.nil?
+      raise ArgumentError.new("give both certificate and private_key, or neither")
+    end
+    if (env = ENV["PG_TEST_URL"]?) && !env.empty? && certificate.nil?
       return Server.new(env, nil, "")
     end
     initdb = Dir.glob("/usr/lib/postgresql/*/bin/initdb").sort.last
-    raise Unavailable.new("no PG_TEST_URL and no initdb to make a server") unless initdb
+    unless initdb
+      raise Unavailable.new(certificate ? "no initdb to make a server with TLS" : "no PG_TEST_URL and no initdb to make a server")
+    end
     bin = File.dirname(initdb)
     dir = "#{Dir.tmpdir}/quarz-pg-#{Process.pid}-#{Random.rand(1_000_000_000)}"
     run("mkdir", "-m", "700", dir)
@@ -107,7 +117,17 @@ module Testing
       # (The first matching line wins.)
       lines = hba + ["local all all scram-sha-256", "host all all 127.0.0.1/32 scram-sha-256"]
       File.write("#{dir}/data/pg_hba.conf", lines.join("\n") + "\n")
-      port = start_on_a_free_port(bin, dir)
+      ssl = ""
+      if certificate && private_key
+        # The server refuses a key file others may read: 0600 before the
+        # key is written.
+        File.write("#{dir}/server.crt", certificate)
+        run("touch", "#{dir}/server.key")
+        run("chmod", "600", "#{dir}/server.key")
+        File.write("#{dir}/server.key", private_key)
+        ssl = "ssl = on\nssl_cert_file = '#{quote(dir)}/server.crt'\nssl_key_file = '#{quote(dir)}/server.key'\n"
+      end
+      port = start_on_a_free_port(bin, dir, ssl)
       Server.new("postgres://quarz:#{password}@127.0.0.1:#{port}/postgres", dir, bin)
     rescue Exception => e
       # (A start that timed out may have left the server running.)
@@ -121,16 +141,18 @@ module Testing
 
   # `start`, or why there is no server: for a test class's `startup`,
   # whose tests then `omit` with the reason.
-  def self.start_or_reason(*, hba: Array[String] = []) -> Server | String
-    start(hba: hba)
+  def self.start_or_reason(*, hba: Array[String] = [], certificate: String? = nil,
+                           private_key: String? = nil) -> Server | String
+    start(hba: hba, certificate: certificate, private_key: private_key)
   rescue Unavailable => e
     e.message
   end
 
   # Runs the block with the URL of a server (`start`), and stops it
-  # afterwards (`hba` as for `start`: nothing to PG_TEST_URL's server).
-  def self.with_cluster[R](*, hba: Array[String] = [], &: (String) -> R) -> R
-    server = start(hba: hba)
+  # afterwards (`hba`, `certificate` and `private_key` as for `start`).
+  def self.with_cluster[R](*, hba: Array[String] = [], certificate: String? = nil,
+                           private_key: String? = nil, &: (String) -> R) -> R
+    server = start(hba: hba, certificate: certificate, private_key: private_key)
     begin
       yield server.url
     ensure
@@ -140,10 +162,10 @@ module Testing
 
   # (The settings go in `postgresql.auto.conf`, not pg_ctl's `-o`, which
   # a shell splits: a directory with a space would not do.)
-  private def self.start_on_a_free_port(bin: String, dir: String) -> Int
+  private def self.start_on_a_free_port(bin: String, dir: String, extra: String) -> Int
     5.times do
       port = Random.rand(20000..60000)
-      conf = "unix_socket_directories = '#{dir.gsub("'", "''")}'\nlisten_addresses = '127.0.0.1'\nport = #{port}\n"
+      conf = "unix_socket_directories = '#{quote(dir)}'\nlisten_addresses = '127.0.0.1'\nport = #{port}\n" + extra
       File.write("#{dir}/data/postgresql.auto.conf", conf)
       out = Process.run("#{bin}/pg_ctl", "-D", "#{dir}/data", "-l", "#{dir}/log", "-w", "-t", "60", "start")
       return port if out.success?
@@ -151,6 +173,9 @@ module Testing
     log = File.exist?("#{dir}/log") ? File.read("#{dir}/log").lines.last(10).join : ""
     raise Error.new("the throwaway server did not start; its log ended with:\n#{log}")
   end
+
+  # `text` for inside a quoted string of postgresql.conf.
+  private def self.quote(text: String) -> String = text.gsub("'", "''")
 
   private def self.run(*command: String) -> Void
     out = Process.run(*command)

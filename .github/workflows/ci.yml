@@ -47,6 +47,10 @@ jobs:
         run: |
           cargo build --release --manifest-path .quarz/Cargo.toml
           echo "$GITHUB_WORKSPACE/.quarz/target/release" >> "$GITHUB_PATH"
+      - name: PostgreSQL's server programs, for the clusters the TLS tests make
+        run: |
+          ls /usr/lib/postgresql/*/bin/initdb 2>/dev/null || { sudo apt-get update && sudo apt-get install -y postgresql; }
+          ls /usr/lib/postgresql/*/bin/initdb
       - name: Check
         run: quarz check
       - name: Test (interpreted)

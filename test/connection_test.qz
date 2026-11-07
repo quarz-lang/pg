@@ -112,7 +112,7 @@ class ConnectionFailureTest < Test::Case
         peer.write("HTTP/1.1 400 Bad Request\r\n\r\n")
         peer.close
       end
-      assert_raise(PG::ProtocolError) { PG.connect(host: "127.0.0.1", port: port, user: "u") }
+      assert_raise(PG::ProtocolError) { PG.connect(host: "127.0.0.1", port: port, user: "u", sslmode: :disable) }
     end
     server.close
   end
@@ -129,7 +129,7 @@ class ConnectionFailureTest < Test::Case
         peer.close
       end
       assert_raise_message(/in clear over TCP/) do
-        PG.connect(host: "127.0.0.1", port: port, user: "u", password: "secret")
+        PG.connect(host: "127.0.0.1", port: port, user: "u", password: "secret", sslmode: :disable)
       end
     end
     server.close
@@ -151,7 +151,7 @@ class ConnectionFailureTest < Test::Case
         peer.close
       end
       assert_raise_message(/without proving/) do
-        PG.connect(host: "127.0.0.1", port: port, user: "u", password: "secret")
+        PG.connect(host: "127.0.0.1", port: port, user: "u", password: "secret", sslmode: :disable)
       end
     end
     server.close

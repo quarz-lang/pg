@@ -59,6 +59,20 @@ public def connect(*, host: String = "localhost", port: Int = 5432, user: String
                              sslrootcert:))
 end
 
+# Raises `ArgumentError` for a channel name the server cannot take as
+# given: empty, holding a NUL, or of 64 bytes or more (an identifier
+# that long is cut to 63 bytes, and `pg_notify` refuses it).
+def check_channel(name: String) -> Void
+  raise ArgumentError.new("an empty channel name") if name.empty?
+  raise ArgumentError.new("a channel name holding a NUL") if name.include?("\x00")
+  raise ArgumentError.new("a channel name of #{name.bytesize} bytes: 63 at most") if name.bytesize > 63
+end
+
+# A NOTIFY on a channel the connection listens to (`PG::Connection#listen`):
+# the channel, the payload (`""` when none was given) and the server
+# process that sent it (`PG::Connection#process_id` on the notifier's side).
+data Notification = (channel: String, payload: String, process_id: Int)
+
 # What a connection is made of, as a Shareable value: its socket and the
 # session's state, so that it can move to another task, which makes a
 # `PG::Connection` of it again (`PG::Connection#release`,
@@ -69,7 +83,13 @@ data Lease = (
   process_id: Int,
   secret: Bytes,
   parameters: Hash[String, String],
-  statements: StatementCache::Snapshot
+  statements: StatementCache::Snapshot,
+  # The notifications received and not yet taken, and the channels
+  # listened to (`PG::Connection#listen`).
+  notifications: Array[Notification],
+  channels: Set[String],
+  # Whether a LISTEN may be in force that `channels` does not show.
+  unsure: Bool
 )
 
 # A session with the server: one task's at a time. Moving it to another
@@ -89,6 +109,13 @@ class Connection
   var @closed: Bool = false
   var @notice_handler: ((Hash[String, String]) -> Void)? = nil
   var @notice_error: StandardError? = nil
+  # Notifications received and not yet taken, oldest first.
+  var @notifications: Array[Notification] = []
+  # The channels `#listen` listened to, and whether a LISTEN may be in
+  # force that they do not show (an UNLISTEN in a transaction, which a
+  # rollback undoes).
+  var @channels: Set[String] = Set[String].new
+  var @unsure: Bool = false
 
   # Connects with `config` and authenticates (see `PG.connect`).
   def self.open(config: Config) -> Connection
@@ -250,6 +277,9 @@ class Connection
     @parameters = lease.parameters
     @process_id = lease.process_id
     @secret = lease.secret
+    @notifications = lease.notifications
+    @channels = lease.channels
+    @unsure = lease.unsure
   end
 
   # Makes a connection of `lease` in the calling task: the session goes on
@@ -276,7 +306,8 @@ class Connection
       return nil
     end
     @closed = true
-    Lease.new(@io, @config, @process_id, @secret, @parameters, @statements.snapshot)
+    Lease.new(@io, @config, @process_id, @secret, @parameters, @statements.snapshot,
+              @notifications, @channels, @unsure)
   end
 
   # The run-time parameters the server reported (server_version,
@@ -299,6 +330,139 @@ class Connection
     when "E" then :failed
     else :idle
     end
+  end
+
+  # Listens to `channel` (LISTEN, the name quoted as an identifier, so
+  # that any name of 1 to 63 bytes works, case kept): the server then
+  # sends this session every NOTIFY on it, which `#wait_for_notify` and
+  # `#notifications` give. Listening again to a channel does nothing. A
+  # LISTEN takes effect when its transaction commits (at once outside
+  # one). Raises `ArgumentError` for an empty name, one holding a NUL, or
+  # one of 64 bytes or more (the server would cut it to 63).
+  #
+  # Listen through this method rather than `exec("LISTEN ...")`: only it
+  # is tracked (`#listening?`), which `PG::Pool` relies on.
+  def listen(channel: String) -> Void
+    exec("LISTEN #{Connection.quote_ident(channel)}")
+    @channels = @channels.add(channel)
+  end
+
+  # Stops listening to `channel` (UNLISTEN). Notifications already
+  # received stay queued. Raises `ArgumentError` for a name `#listen`
+  # refuses.
+  def unlisten(channel: String) -> Void
+    exec("UNLISTEN #{Connection.quote_ident(channel)}")
+    @channels = @channels.delete(channel)
+    @unsure = true unless @status == "I"
+  end
+
+  # Stops listening to every channel (`UNLISTEN *`), whichever way it was
+  # listened to. Notifications already received stay queued.
+  def unlisten_all -> Void
+    exec("UNLISTEN *")
+    @channels = Set[String].new
+    @unsure = @status != "I"
+  end
+
+  # Whether a LISTEN through `#listen` may be in force on this session: a
+  # channel listened to and not unlistened, or an `#unlisten` in a
+  # transaction (a rollback would undo it). A LISTEN sent with `#exec`
+  # is not seen.
+  def listening? -> Bool = !@channels.empty? || @unsure
+
+  # Sends a notification on `channel` with `payload` (`pg_notify`, as a
+  # query with parameters: no quoting). Inside a transaction it is
+  # delivered when the transaction commits, and not at all if it rolls
+  # back. Raises `ArgumentError` for a channel name `#listen` refuses,
+  # and `PG::ServerError` for what the server refuses (a payload of 8000
+  # bytes or more).
+  def notify(channel: String, payload: String = "") -> Void
+    ::check_channel(channel)
+    query("SELECT pg_notify($1, $2)", [channel, payload])
+    nil
+  end
+
+  # The notifications received so far and not yet taken, oldest first,
+  # taking them: those that arrived while the connection ran queries, or
+  # read by `#wait_for_notify` along with others. Does not read the
+  # socket.
+  def notifications -> Array[Notification]
+    all = @notifications
+    @notifications = []
+    all
+  end
+
+  # The next notification: a queued one (see `#notifications`), else one
+  # read from the socket, waiting up to `timeout` (`nil`: without limit).
+  # Returns nil when `timeout` passes first. Only the calling task waits;
+  # `Task.timeout` and `cancel` interrupt the wait. An interrupted wait
+  # leaves the connection usable when it was waiting between messages, as
+  # it nearly always is; one interrupted in the middle of a message (the
+  # rest of it not arrived yet) closes the connection, as `#exec` says.
+  # The server delivers notifications only between transactions: inside
+  # one (`#transaction`), this waits for its timeout.
+  # Raises `PG::ConnectionError` when the connection is closed or breaks,
+  # `PG::ServerError` when the server ends the session (an administrator's
+  # `pg_terminate_backend`, a shutdown).
+  def wait_for_notify(timeout: Duration? = nil) -> Notification?
+    if (n = @notifications.first?)
+      @notifications = @notifications.shift
+      return n
+    end
+    raise ConnectionError.new("the connection is closed") if @closed
+    deadline = timeout ? Time.monotonic + timeout : nil
+    loop do
+      left = deadline ? deadline - Time.monotonic : nil
+      ready = begin
+        # (A time left below zero waits not at all.)
+        @io.wait_readable(timeout: left)
+      rescue IOError, SystemCallError => e
+        broken(e.message)
+      end
+      return nil unless ready
+      # A whole message, or the connection closed: never out of step.
+      done = false
+      m = begin
+        r = receive_one
+        done = true
+        r
+      ensure
+        unless done
+          @closed = true
+          close_io
+        end
+      end
+      case m
+      in nil then nil
+      in Backend::ErrorResponse(fields:)
+        # A FATAL error: the server ends the session.
+        refused(fields)
+      else
+        unexpected(m, "while waiting for a notification")
+      end
+      # (A notification that came with it stays queued.)
+      if (e = @notice_error)
+        @notice_error = nil
+        raise e
+      end
+      if (n = @notifications.first?)
+        @notifications = @notifications.shift
+        return n
+      end
+    end
+  end
+
+  # `name` as an SQL identifier: double-quoted, a `"` in it doubled.
+  # Raises `ArgumentError` for an empty name, one holding a NUL, or one of
+  # 64 bytes or more (the server cuts an identifier to 63 bytes).
+  #
+  # ```
+  # PG::Connection.quote_ident("jobs")      # => "\"jobs\""
+  # PG::Connection.quote_ident("a\"b c")    # => "\"a\"\"b c\""
+  # ```
+  def self.quote_ident(name: String) -> String
+    ::check_channel(name)
+    "\"#{name.gsub("\"", "\"\"")}\""
   end
 
   # Calls the block with each notice or warning the server sends (its
@@ -773,36 +937,47 @@ class Connection
     broken(e.message)
   end
 
-  # The next message that is not about the session itself: parameter
-  # changes are recorded, and notices go to the handler.
+  # The next message that is not about the session itself (see
+  # `#receive_one`).
   private def receive -> Backend
     loop do
-      m = begin
-        @reader.read
-      rescue ConnectionError => e
-        # The end of the stream, or bytes that are not the protocol.
-        @closed = true
-        close_io
-        raise e
-      rescue IOError, SystemCallError => e
-        broken(e.message)
-      end
-      case m
-      in Backend::ParameterStatus(name:, value:)
-        @parameters = @parameters.put(name, value)
-      in Backend::NoticeResponse(fields:)
-        begin
-          @notice_handler&.call(fields)
-        rescue StandardError => e
-          # Raised once the answer is read, to keep the stream in step.
-          @notice_error = @notice_error || e
-        end
-      in Backend::NotificationResponse
-        # LISTEN/NOTIFY has no API yet: dropped.
-        nil
-      else
+      if (m = receive_one)
         return m
       end
+    end
+  end
+
+  # The next message, or nil for one about the session itself: parameter
+  # changes are recorded, notices go to the handler, and notifications to
+  # the queue.
+  private def receive_one -> Backend?
+    m = begin
+      @reader.read
+    rescue ConnectionError => e
+      # The end of the stream, or bytes that are not the protocol.
+      @closed = true
+      close_io
+      raise e
+    rescue IOError, SystemCallError => e
+      broken(e.message)
+    end
+    case m
+    in Backend::ParameterStatus(name:, value:)
+      @parameters = @parameters.put(name, value)
+      nil
+    in Backend::NoticeResponse(fields:)
+      begin
+        @notice_handler&.call(fields)
+      rescue StandardError => e
+        # Raised once the answer is read, to keep the stream in step.
+        @notice_error = @notice_error || e
+      end
+      nil
+    in Backend::NotificationResponse(process_id:, channel:, payload:)
+      @notifications = @notifications.push(Notification.new(channel, payload, process_id))
+      nil
+    else
+      m
     end
   end
 

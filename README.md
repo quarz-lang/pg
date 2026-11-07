@@ -131,6 +131,57 @@ PG::Pool.open("postgres://app@localhost/shop", size: 8) do |pool|
 end
 ```
 
+- LISTEN/NOTIFY: `conn.listen(channel)` (the name quoted as an
+  identifier), `unlisten(channel)`, `unlisten_all`, `listening?`, and
+  `notify(channel, payload = "")` (`pg_notify`; delivered at commit
+  inside a transaction; a payload under 8000 bytes). A channel name has
+  1 to 63 bytes (`ArgumentError` otherwise).
+  `conn.wait_for_notify(timeout: 5.seconds)` gives the next
+  `PG::Notification` (`channel`, `payload`, the notifier's
+  `process_id`), or nil at the timeout (`nil` waits without limit).
+  Notifications that arrive while the connection runs queries are
+  queued, in order: `wait_for_notify` takes those first, and
+  `conn.notifications` takes them all without reading the socket. The
+  queue and the channels go with a `PG::Lease`.
+
+  The wait suspends only its task, and `Task.timeout` and `cancel`
+  interrupt it. It waits for the socket to be readable before reading a
+  message, so an interruption between messages (nearly always) leaves
+  the connection usable; one in the middle of a message closes it, as
+  for a query cut short. A connection is one task's, so to hand
+  notifications to other tasks, listen on a connection of its own in a
+  task of its own and send them on a `Channel` (this runs until
+  cancelled):
+
+```ruby
+notes = Channel[PG::Notification].new(100)
+Task.scope do |s|
+  s.spawn do
+    conn = PG.connect(url)
+    begin
+      conn.listen("jobs")
+      loop do
+        if (n = conn.wait_for_notify)
+          notes.send(n)
+        end
+      end
+    ensure
+      conn.close
+    end
+  end
+  s.spawn do
+    while (n = notes.receive?)
+      puts n.payload
+    end
+  end
+end
+```
+
+  Listen with `listen`, not `exec("LISTEN ...")`, which is not tracked.
+  `PG::Pool` sends `UNLISTEN *` on a connection given back that
+  `listening?`, and drops what it received: use a dedicated
+  `PG.connect` for a listener.
+
 - `PG::Testing`, for the tests of a program or cog that uses pg:
   `PG::Testing.with_cluster { |url| ... }` runs the block against
   `PG_TEST_URL`'s server when that is set, or else a throwaway cluster
@@ -141,7 +192,7 @@ end
   tests when there is none). Given `certificate:` and `private_key:`
   (PEM), the cluster is always a throwaway one, with TLS on.
 
-Not yet: LISTEN/NOTIFY as an API, COPY, cancel requests, client
+Not yet: COPY, cancel requests, client
 certificates, channel binding.
 
 ## Differences from libpq

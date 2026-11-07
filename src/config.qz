@@ -25,7 +25,8 @@ data Config = (
   sslmode: Symbol,
   # The roots the server's certificate is verified against: a PEM file's
   # path, or `system` for the system's store (nil: `~/.postgresql/root.crt`
-  # for `:verify_ca` and `:verify_full`, no verification for the others).
+  # when it exists; without roots, only `:verify_ca` and `:verify_full`
+  # fail, the others go unverified).
   sslrootcert: String?
 )
 
@@ -37,8 +38,10 @@ data Config = (
 # `application_name`, `connect_timeout` (seconds), `max_scram_iterations`,
 # `statement_cache_size`, `sslmode` (`disable`, `allow`, `prefer`, the
 # default, `require`, `verify-ca` or `verify-full`: see `PG.connect`) and
-# `sslrootcert` are read. `channel_binding` may be `disable` or `prefer`
-# (no channel binding either way) and `sslnegotiation` `postgres`.
+# `sslrootcert` (a PEM file's path, or `system`, which makes `sslmode`
+# `verify-full` unless given, and refuses a weaker one) are read.
+# `channel_binding` may be `disable` or `prefer` (no channel binding
+# either way) and `sslnegotiation` `postgres`.
 # Client certificates (`sslcert`, `sslkey`, `sslpassword`), `sslcrl`
 # and `channel_binding=require` are not supported: they raise
 # `ArgumentError`, as does a malformed URL or an unknown parameter.
@@ -50,6 +53,8 @@ data Config = (
 # PG.parse_url("postgres://ann@%2Ftmp/shop").host   # => "/tmp"
 # PG.parse_url("postgres://h/d?sslmode=verify-full").sslmode   # => :verify_full
 # PG.parse_url("postgres://h/d").sslmode                       # => :prefer
+# PG.parse_url("postgres://h/d?sslrootcert=system").sslmode    # => :verify_full
+# PG.parse_url("postgres://h/d?sslrootcert=system&sslmode=require")  # raises ArgumentError
 # PG.parse_url("postgres://h/d?sslcert=client.pem")  # raises ArgumentError
 # ```
 public def parse_url(url: String) -> Config
@@ -72,7 +77,7 @@ public def parse_url(url: String) -> Config
   connect_timeout: Duration? = nil
   max_scram_iterations = Scram::MAX_ITERATIONS
   statement_cache_size = Connection::STATEMENT_CACHE_SIZE
-  sslmode = :prefer
+  sslmode: Symbol? = nil
   sslrootcert: String? = nil
   (m[5] || "").split("&").each do |pair|
     next if pair.empty?
@@ -118,7 +123,8 @@ public def parse_url(url: String) -> Config
              user: user || Config.default_user, password: password, database: database,
              application_name: application_name, allow_cleartext: false,
              connect_timeout: connect_timeout, max_scram_iterations: max_scram_iterations,
-             statement_cache_size: statement_cache_size, sslmode: sslmode, sslrootcert: sslrootcert)
+             statement_cache_size: statement_cache_size,
+             sslmode: Config.sslmode(sslmode, sslrootcert), sslrootcert: sslrootcert)
 end
 
 extension Config
@@ -154,6 +160,18 @@ extension Config
     mode = text.tr("-", "_").to_sym
     raise ArgumentError.new("sslmode: #{text.inspect}") unless sslmode?(mode) && !text.include?("_")
     mode
+  end
+
+  # The `sslmode` of a connection given `mode` (nil: none given) and
+  # `rootcert`: `:prefer` by default, `:verify_full` with the system's
+  # roots, with which a weaker mode raises `ArgumentError` (libpq 16).
+  def self.sslmode(mode: Symbol?, rootcert: String?) -> Symbol
+    return mode || :prefer unless rootcert == "system"
+    m = mode || :verify_full
+    unless m == :verify_ca || m == :verify_full
+      raise ArgumentError.new("sslmode #{m} with sslrootcert=system: the system's roots need verify-full")
+    end
+    m
   end
 
   # Whether `mode` is a value of `sslmode`: `:disable`, `:allow`,

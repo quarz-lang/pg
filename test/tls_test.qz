@@ -7,6 +7,15 @@ module TlsFixtures
   def self.path(name: String) -> String = "#{DIR}/#{name}"
 
   def self.read(name: String) -> String = File.read(path(name))
+
+  # A `~/.postgresql/root.crt` makes the connections without
+  # `sslrootcert` verify against it: their tests omit then.
+  def self.no_home_roots(test: Test::Case) -> Void
+    home = ENV["HOME"]? || ""
+    if !home.empty? && File.exist?("#{home}/.postgresql/root.crt")
+      test.omit("#{home}/.postgresql/root.crt would verify this connection")
+    end
+  end
 end
 
 # Against servers of ours with TLS on (PG::Testing with a certificate),
@@ -45,8 +54,11 @@ class TlsTest < Test::Case
     end
   end
 
+  def no_home_roots -> Void = TlsFixtures.no_home_roots(self)
+
   # The SSL server's URL with `params`, its host spelled `host`.
   def ssl_url(params: String, host: String = "127.0.0.1") -> String
+    no_home_roots unless params.include?("sslrootcert=") || params.include?("sslmode=disable")
     "#{server(SSL).url.sub("@127.0.0.1:", "@#{host}:")}?#{params}"
   end
 
@@ -162,6 +174,7 @@ class TlsTest < Test::Case
     assert_true(c.tls?)
     c.close
     # The default.
+    no_home_roots
     c = PG.connect(server(SSL).url)
     assert_true(c.tls?)
     c.close
@@ -178,6 +191,7 @@ class TlsTest < Test::Case
   end
 
   def test_allow
+    no_home_roots
     c = PG.connect("#{server(HOSTSSL).url}?sslmode=allow")
     assert_true(c.tls?)
     c.close
@@ -244,6 +258,30 @@ class TlsTest < Test::Case
     assert_equal([true, true], got)
   end
 
+  # `~/.postgresql/root.crt` makes `require` verify, as libpq does: in a
+  # `quarz test` of test/tls_home_test.qz with HOME set (the test needs
+  # `quarz` on PATH).
+  def test_root_crt_in_home
+    s = server(SSL)
+    quarz = ENV["PATH"]?.to_s.split(":").map { |d| "#{d}/quarz" }.find { |f| File.file?(f) && File.executable?(f) }
+    omit("no quarz on PATH to run test/tls_home_test.qz with another HOME") unless quarz
+    home = "#{Dir.tmpdir}/quarz-pg-home-#{Process.pid}-#{Random.rand(1_000_000_000)}"
+    Process.run("mkdir", "-p", "#{home}/.postgresql")
+    begin
+      [["ca.pem", "verified"], ["other-ca.pem", "refused"], ["README.md", "junk"]].each do |pair|
+        File.write("#{home}/.postgresql/root.crt", TlsFixtures.read(pair[0]))
+        # (The URL names localhost, which the certificate covers.)
+        url = s.url.sub("@127.0.0.1:", "@localhost:")
+        out = Process.run("env", "HOME=#{home}", "PG_TLS_HOME_URL=#{url}", "PG_TLS_HOME_EXPECT=#{pair[1]}",
+                          quarz, "test", "--no-doc", "test/tls_home_test.qz")
+        assert_true(out.success?, "#{pair[1]}: #{out.stdout}#{out.stderr}")
+        assert_match(/1 tests, [1-9]\d* assertions, 0 failures, 0 errors/, out.stdout)
+      end
+    ensure
+      Process.run("rm", "-rf", home)
+    end
+  end
+
   def test_connect_timeout_with_tls
     c = PG.connect(ssl_url("sslmode=verify-full&sslrootcert=#{ca}&connect_timeout=10", "localhost"))
     assert_true(c.tls?)
@@ -298,6 +336,7 @@ class TlsClientTest < Test::Case
 
   # `S`, then no handshake: `connect_timeout` bounds it.
   def test_connect_timeout_bounds_the_handshake
+    TlsFixtures.no_home_roots(self)
     against(b"S", 2.seconds) do |port|
       started = Process.clock
       assert_raise_message(/no answer from 127.0.0.1:\d+ within/) do
@@ -310,6 +349,7 @@ class TlsClientTest < Test::Case
   # Not TLS after the `S` (bytes sent with it, before the handshake):
   # a TLS failure, as a ConnectionError.
   def test_not_tls_after_s
+    TlsFixtures.no_home_roots(self)
     against(b"SHTTP/1.1 400 Bad Request\r\n\r\n") do |port|
       e = assert_raise(PG::ConnectionError) { PG.connect(host: "127.0.0.1", port: port, user: "u", sslmode: :require) }
       assert_match(/cannot connect to 127\.0\.0\.1:\d+: /, e.message)
@@ -326,6 +366,22 @@ class TlsClientTest < Test::Case
       assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?sslmode=#{text}") }
     end
     assert_raise(ArgumentError) { PG.connect(host: "h", sslmode: :verify) }
+  end
+
+  # The system's roots: verify-full unless given, a weaker mode refused
+  # (libpq 16).
+  def test_sslrootcert_system
+    assert_equal(:verify_full, PG.parse_url("postgres://h/d?sslrootcert=system").sslmode)
+    assert_equal(:verify_ca, PG.parse_url("postgres://h/d?sslrootcert=system&sslmode=verify-ca").sslmode)
+    assert_equal(:verify_full, PG.parse_url("postgres://h/d?sslmode=verify-full&sslrootcert=system").sslmode)
+    ["disable", "allow", "prefer", "require"].each do |mode|
+      e = assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?sslrootcert=system&sslmode=#{mode}") }
+      assert_true(e.message.include?("sslrootcert=system"), e.message)
+      assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?sslmode=#{mode}&sslrootcert=system") }
+    end
+    assert_raise(ArgumentError) { PG.connect(host: "127.0.0.1", port: 1, user: "u", sslmode: :prefer, sslrootcert: "system") }
+    # A path keeps the default.
+    assert_equal(:prefer, PG.parse_url("postgres://h/d?sslrootcert=%2Fetc%2Fca.pem").sslmode)
   end
 
   def test_sslrootcert

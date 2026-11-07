@@ -36,9 +36,12 @@ Work in progress. What exists:
   | `verify-ca`, `verify-full` | TLS, the server's certificate and name verified |
 
   `sslrootcert` names the roots: a PEM file, or `system` for the
-  system's store; without it, `verify-ca` and `verify-full` read
-  `~/.postgresql/root.crt`, and `prefer` and `require` encrypt without
-  verifying the server (given one, they verify as `verify-full`). A unix
+  system's store (then `sslmode` is `verify-full` unless given, and a
+  weaker one than `verify-ca` is an `ArgumentError`). Without it,
+  `~/.postgresql/root.crt` is read when it exists. With roots, `allow`,
+  `prefer` and `require` verify the server as `verify-full` does (so a
+  stale `root.crt` makes `require` fail); without them they encrypt
+  without verifying, and `verify-ca` and `verify-full` fail. A unix
   socket never uses TLS, whatever `sslmode` says.
 
   ```ruby
@@ -151,18 +154,19 @@ For now, to be revisited:
 - The default user is `$PGUSER`, then `$USER` (libpq: the operating
   system's user name).
 - `verify-ca` verifies the server's name too, as `verify-full` does
-  (stricter than libpq: rustls has no chain-only verification).
+  (stricter than libpq: rustls has no chain-only verification), and so
+  do `allow`, `prefer` and `require` when there are roots (libpq
+  verifies them as `verify-ca`): a server reached by a name or address
+  its certificate does not list is refused. For the same reason
+  `sslrootcert=system` accepts `verify-ca` (libpq: `verify-full` only).
 - No client certificates (`sslcert`, `sslkey`, `sslpassword`), no
   revocation lists (`sslcrl`), no channel binding (`channel_binding`
   may be `disable` or `prefer`, and the client uses SCRAM-SHA-256 even
   when the server offers SCRAM-SHA-256-PLUS), no direct TLS negotiation
   (`sslnegotiation=postgres` only): the others raise `ArgumentError`.
 - With `prefer`, a server that agrees to TLS and then fails the
-  handshake is an error (libpq tries again in plain).
-- `prefer` and `require` verify the server only when `sslrootcert` is
-  given (libpq: also when `~/.postgresql/root.crt` exists), and
-  `sslrootcert=system` leaves the default `sslmode` `prefer` (libpq:
-  `verify-full`).
+  handshake (a stale `root.crt` included) is an error (libpq tries
+  again in plain).
 - A SCRAM iteration count above 1,000,000 is refused unless the
   connection raises `max_scram_iterations` (keyword or URL parameter).
 

@@ -18,20 +18,26 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 # - `:disable`: never.
 # - `:allow`: not at first; when the server refuses the session (a
 #   `pg_hba.conf` that takes only `hostssl`), once more over TLS.
-# - `:prefer` (the default): over TLS when the server speaks it, else
-#   in plain.
+# - `:prefer` (the default, unless `sslrootcert` is `"system"`): over
+#   TLS when the server speaks it, else in plain.
 # - `:require`: over TLS, else `PG::ConnectionError`.
 # - `:verify_ca`, `:verify_full`: over TLS, the server's certificate
 #   verified against the roots `sslrootcert` names, its name too (the
 #   host as given, a name or an address). `:verify_ca` is `:verify_full`
 #   here: the name is always verified, which is stricter than libpq.
 #
-# With `:prefer` and `:require` the certificate is not verified (the
-# session is encrypted, the server not authenticated) unless
-# `sslrootcert` is given, which makes them verify as `:verify_full`.
 # `sslrootcert` is a PEM file's path, or `"system"` for the system's
-# store; nil for `:verify_ca` and `:verify_full` means
-# `~/.postgresql/root.crt`. A unix socket (`host` starting with `/`)
+# store; nil means `~/.postgresql/root.crt`, read only when it exists
+# (`:verify_ca` and `:verify_full` raise `PG::ConnectionError` when it
+# does not). With `"system"`, `sslmode` is `:verify_full` unless given,
+# and a weaker one (`:disable` to `:require`) raises `ArgumentError`, as
+# in libpq.
+#
+# With `:allow`, `:prefer` and `:require`, the server is verified (as
+# with `:verify_full`) when there are roots: `sslrootcert`, or an
+# existing `~/.postgresql/root.crt`, as libpq does; without them the
+# session is encrypted but the server not authenticated. So a stale
+# `root.crt` makes `:require` fail. A unix socket (`host` starting with `/`)
 # never uses TLS, whatever `sslmode` says. A TLS failure (a certificate
 # refused, a handshake that fails) is a `PG::ConnectionError` saying why.
 public def connect(*, host: String = "localhost", port: Int = 5432, user: String = Config.default_user,
@@ -39,15 +45,18 @@ public def connect(*, host: String = "localhost", port: Int = 5432, user: String
                    allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
                    max_scram_iterations: Int = Scram::MAX_ITERATIONS,
                    statement_cache_size: Int = Connection::STATEMENT_CACHE_SIZE,
-                   sslmode: Symbol = :prefer, sslrootcert: String? = nil) -> Connection
+                   sslmode: Symbol? = nil, sslrootcert: String? = nil) -> Connection
   if statement_cache_size < 0 || statement_cache_size > 999_999
     raise ArgumentError.new("statement_cache_size: #{statement_cache_size}")
   end
-  raise ArgumentError.new("sslmode: #{sslmode.inspect}") unless Config.sslmode?(sslmode)
+  if (mode = sslmode)
+    raise ArgumentError.new("sslmode: #{mode.inspect}") unless Config.sslmode?(mode)
+  end
   raise ArgumentError.new("sslrootcert: empty") if sslrootcert == ""
   Connection.open(Config.new(host:, port:, user:, password:, database:, application_name:,
                              allow_cleartext:, connect_timeout:, max_scram_iterations:,
-                             statement_cache_size:, sslmode:, sslrootcert:))
+                             statement_cache_size:, sslmode: Config.sslmode(sslmode, sslrootcert),
+                             sslrootcert:))
 end
 
 # What a connection is made of, as a Shareable value: its socket and the
@@ -96,23 +105,30 @@ class Connection
 
   private def self.start(config: Config) -> Connection
     # (libpq does the same: a unix socket is never encrypted.)
-    return start(config, nil) if config.host.start_with?("/")
+    return start(config, false) if config.host.start_with?("/")
     case config.sslmode
-    when :disable then start(config, nil)
+    when :disable then start(config, false)
     when :allow
       begin
-        start(config, nil)
+        start(config, false)
       rescue ServerError
         # A `pg_hba.conf` that takes only `hostssl`: once more, over TLS.
-        start(config, tls_config(config))
+        start(config, true)
       end
-    else start(config, tls_config(config))
+    else start(config, true)
     end
   end
 
-  # Connects and starts the session: over TLS when `tls` is given and the
+  # Connects and starts the session: over TLS when `tls` says so and the
   # server agrees (it must, unless `sslmode` is `:prefer` or `:allow`).
-  private def self.start(config: Config, tls: TLS::Config?) -> Connection
+  private def self.start(config: Config, tls: Bool) -> Connection
+    # Roots asked for (`sslrootcert`, or the verify modes, which need
+    # them) are read before connecting: a missing file is the caller's
+    # mistake. For `:allow`, `:prefer` and `:require` without
+    # `sslrootcert`, `~/.postgresql/root.crt` is read only when the
+    # server agrees to TLS.
+    asked = tls && (config.sslrootcert || config.sslmode == :verify_ca || config.sslmode == :verify_full)
+    early = asked ? tls_config(config) : nil
     io: IO = begin
       if config.host.start_with?("/")
         UNIXSocket.new("#{config.host}/.s.PGSQL.#{config.port}")
@@ -123,8 +139,8 @@ class Connection
       raise ConnectionError.new("cannot connect to #{Connection.where(config)}: #{e.message}")
     end
     begin
-      if (t = tls) && (sock = io.as?(TCPSocket))
-        io = secure(config, sock, t)
+      if tls && (sock = io.as?(TCPSocket))
+        io = secure(config, sock, early)
       end
       conn = Connection.new(config, io)
       conn.startup
@@ -140,7 +156,7 @@ class Connection
 
   # Asks the server for TLS (an SSLRequest) and runs the handshake when it
   # agrees; when it refuses, `sock` itself unless TLS is required.
-  private def self.secure(config: Config, sock: TCPSocket, tls: TLS::Config) -> IO
+  private def self.secure(config: Config, sock: TCPSocket, tls: TLS::Config?) -> IO
     answer = begin
       sock.write(Frontend.ssl_request)
       sock.read_bytes(1)
@@ -149,8 +165,9 @@ class Connection
     end
     case answer
     when b"S"
+      t = tls || tls_config(config)
       begin
-        TLSSocket.connect(sock, config.host, tls)
+        TLSSocket.connect(sock, config.host, t)
       rescue IOError, SystemCallError, ArgumentError => e
         # (`TLS::Error` is an `IOError`; `ArgumentError`: a host that is
         # not a server name to TLS, an IPv6 address with a zone, say.)
@@ -170,34 +187,41 @@ class Connection
     end
   end
 
-  # The TLS configuration `config` asks for: verified when `sslmode` is
-  # `:verify_ca` or `:verify_full`, or `sslrootcert` is given.
+  # The TLS configuration `config` asks for: verified when there are
+  # roots (`sslrootcert`, or an existing `~/.postgresql/root.crt`, as
+  # libpq does), which `:verify_ca` and `:verify_full` require.
   private def self.tls_config(config: Config) -> TLS::Config
-    verify = config.sslmode == :verify_ca || config.sslmode == :verify_full
     path = config.sslrootcert
     unless path
-      return TLS::Config.new(verify: false) unless verify
       home = ENV["HOME"]? || ""
       default = "#{home}/.postgresql/root.crt"
-      unless !home.empty? && File.exist?(default)
+      if !home.empty? && File.exist?(default)
+        return TLS::Config.new(roots: roots(default, true))
+      elsif config.sslmode == :verify_ca || config.sslmode == :verify_full
         raise ConnectionError.new("sslmode #{config.sslmode} needs the roots to verify the server against: " +
                                   "give sslrootcert (a PEM file, or system), or put them in #{default}")
+      else
+        return TLS::Config.new(verify: false)
       end
-      path = default
     end
     return TLS::Config.new(roots: TLS::Roots.system) if path == "system"
-    pem = begin
-      File.read_bytes(path)
+    TLS::Config.new(roots: roots(path, false))
+  end
+
+  # The roots of the PEM file `path`: an `ArgumentError` when it cannot
+  # be read or holds none, a `PG::ConnectionError` for `~/.postgresql/root.crt`
+  # (`default`), which the caller did not name.
+  private def self.roots(path: String, default: Bool) -> TLS::Roots
+    problem = begin
+      pem = File.read_bytes(path)
+      return TLS::Roots.from_pem(pem) unless pem.empty?
+      "empty"
     rescue IOError, SystemCallError => e
-      raise ArgumentError.new("sslrootcert #{path}: #{e.message}")
+      # (`TLS::Error`, a file that holds no certificate, is an `IOError`.)
+      e.message
     end
-    raise ArgumentError.new("sslrootcert #{path}: empty") if pem.empty?
-    roots = begin
-      TLS::Roots.from_pem(pem)
-    rescue TLS::Error => e
-      raise ArgumentError.new("sslrootcert #{path}: #{e.message}")
-    end
-    TLS::Config.new(roots: roots)
+    raise ConnectionError.new("the roots in #{path}: #{problem}") if default
+    raise ArgumentError.new("sslrootcert #{path}: #{problem}")
   end
 
   # Where `config` points, for messages.

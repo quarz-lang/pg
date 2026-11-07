@@ -1,0 +1,48 @@
+require "test"
+
+# Run by `TlsTest#test_root_crt_in_home` in a `quarz test` of its own,
+# with HOME set to a directory holding `.postgresql/root.crt`: the
+# environment says which server and what to expect. Passes without
+# doing anything otherwise (in the suite's own run).
+class TlsHomeTest < Test::Case
+  def test_root_crt_in_home
+    url = ENV["PG_TLS_HOME_URL"]? || return
+    case ENV["PG_TLS_HOME_EXPECT"]?
+    when "verified"
+      # require, verified against root.crt.
+      c = PG.connect("#{url}?sslmode=require")
+      assert_true(c.tls?)
+      c.close
+    when "refused"
+      # A root.crt of another CA: require fails.
+      assert_raise_message(/certificate verify failed/) { PG.connect("#{url}?sslmode=require") }
+      # verify-full too.
+      assert_raise_message(/certificate verify failed/) { PG.connect("#{url}?sslmode=verify-full") }
+    when "junk"
+      # A root.crt that holds no certificate: read only when the server
+      # agrees to TLS, so nothing listening is the error...
+      port = TCPServer.new("127.0.0.1", 0).then { |s| p = s.local_address.port; s.close; p }
+      assert_raise_message(/cannot connect to 127\.0\.0\.1/) { PG.connect(host: "127.0.0.1", port: port, user: "u") }
+      # ...nor when the server refuses TLS (`N`, then it hangs up: the
+      # startup's error, not the roots')...
+      server = TCPServer.new("127.0.0.1", 0)
+      refusing = server.local_address.port
+      Task.scope do |scope|
+        scope.spawn do
+          peer = server.accept
+          peer.read_bytes(8)
+          peer.write(b"N")
+          peer.read_bytes(4)
+          peer.close
+        end
+        e = assert_raise(PG::ConnectionError) { PG.connect(host: "127.0.0.1", port: refusing, user: "u") }
+        assert_false(e.message.include?("root"), e.message)
+      end
+      server.close
+      # ...and against a TLS server, a ConnectionError naming it.
+      assert_raise_message(/the roots in .*\.postgresql\/root\.crt/) { PG.connect("#{url}?sslmode=require") }
+    else
+      flunk("PG_TLS_HOME_EXPECT: verified, refused or junk")
+    end
+  end
+end

@@ -20,6 +20,9 @@
 #   is idle (a transaction the work left open is rolled back first);
 #   otherwise (broken, or a call cut short by cancellation or a timeout)
 #   it is closed, and the pool opens another when one is needed.
+# - A connection given back stops listening (`UNLISTEN *`, when
+#   `PG::Connection#listening?`), and the notifications it received are
+#   dropped: a listener uses a connection of its own (`PG.connect`).
 # - `#close`, or the end of `.open`'s block, closes the idle connections
 #   and those given back later; calls waiting for one raise
 #   `PG::ConnectionError` ("pool closed").
@@ -154,6 +157,7 @@ class Pool
   end
 
   private def checkin(conn: Connection) -> Void
+    quiet(conn)
     lease = conn.release
     unless lease
       @opened.update { |k| k - 1 }
@@ -166,6 +170,22 @@ class Pool
       false
     end
     discard(lease) unless sent
+  end
+
+  # A connection given back stops listening (`UNLISTEN *`, after rolling
+  # back a transaction left open, which would undo it), and the
+  # notifications it received are dropped: its next user gets none it
+  # did not ask for. One that cannot is closed.
+  private def quiet(conn: Connection) -> Void
+    return if conn.closed?
+    if conn.listening?
+      conn.exec("ROLLBACK") unless conn.transaction_status == :idle
+      conn.unlisten_all
+    end
+    conn.notifications
+    nil
+  rescue Exception
+    conn.close
   end
 
   # Tells a waiter, if any, that a connection may be opened.

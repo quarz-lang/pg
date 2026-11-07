@@ -1,0 +1,295 @@
+require "test"
+
+# LISTEN/NOTIFY against a real server (PG::Testing).
+class NotifyTest < Test::Case
+  SERVER = Atom[PG::Testing::Server | String].new("not started")
+
+  def self.startup
+    SERVER.set(PG::Testing.start_or_reason)
+  end
+
+  def self.shutdown
+    case SERVER.get
+    in PG::Testing::Server => s then s.stop
+    else nil
+    end
+  end
+
+  def url -> String
+    case SERVER.get
+    in PG::Testing::Server => s then s.url
+    in String => why then omit(why)
+    end
+  end
+
+  # Runs the block with a listener and a notifier, closed afterwards.
+  def pair(&: (PG::Connection, PG::Connection) -> Void) -> Void
+    listener = PG.connect(url)
+    notifier = PG.connect(url)
+    begin
+      yield listener, notifier
+    ensure
+      listener.close
+      notifier.close
+    end
+  end
+
+  def test_a_notification_from_another_session
+    pair do |listener, notifier|
+      assert_false(listener.listening?)
+      listener.listen("jobs")
+      assert_true(listener.listening?)
+      notifier.notify("jobs", "42")
+      n = listener.wait_for_notify(timeout: 5.seconds) || flunk("no notification")
+      assert_equal("jobs", n.channel)
+      assert_equal("42", n.payload)
+      assert_equal(notifier.process_id, n.process_id)
+      notifier.notify("jobs")
+      assert_equal("", listener.wait_for_notify(timeout: 5.seconds)&.payload)
+    end
+  end
+
+  def test_notifications_that_arrive_during_queries_are_queued
+    pair do |listener, notifier|
+      listener.listen("q")
+      notifier.notify("q", "one")
+      notifier.notify("q", "two")
+      # The server sends them while the listener is idle: the next
+      # answers read them first.
+      listener.exec("SELECT pg_sleep(0.05)")
+      listener.exec("SELECT 1")
+      queued = listener.notifications
+      assert_equal(["one", "two"], queued.map(&:payload))
+      assert_equal([], listener.notifications)
+      notifier.notify("q", "three")
+      listener.exec("SELECT pg_sleep(0.05)")
+      listener.exec("SELECT 1")
+      # wait_for_notify takes a queued one without reading.
+      assert_equal("three", listener.wait_for_notify(timeout: 0.seconds)&.payload)
+    end
+  end
+
+  def test_a_timeout_returns_nil_and_the_connection_goes_on
+    pair do |listener, _|
+      listener.listen("quiet")
+      assert_nil(listener.wait_for_notify(timeout: 50.ms))
+      assert_false(listener.closed?)
+      assert_equal(1, listener.exec("SELECT 1").rows[0].int(0))
+    end
+  end
+
+  def test_task_timeout_around_a_wait_leaves_the_connection_usable
+    pair do |listener, notifier|
+      listener.listen("t")
+      assert_raise(Task::Timeout) do
+        Task.timeout(50.ms) { listener.wait_for_notify }
+      end
+      assert_false(listener.closed?)
+      assert_equal(2, listener.exec("SELECT 2").rows[0].int(0))
+      notifier.notify("t", "after")
+      assert_equal("after", listener.wait_for_notify(timeout: 5.seconds)&.payload)
+    end
+  end
+
+  def test_a_cancelled_wait_leaves_the_connection_usable
+    leased = Atom[PG::Lease?].new(nil)
+    target = url
+    listening = Channel[Bool].new(1)
+    Task.scope do |s|
+      waiter = s.spawn do
+        conn = PG.connect(target)
+        conn.listen("c")
+        listening.send(true)
+        begin
+          conn.wait_for_notify
+        rescue Task::Cancelled => e
+          # Cancelled between messages: the session is in step.
+          leased.set(conn.closed? ? nil : conn.release)
+          raise e
+        end
+        nil
+      end
+      listening.receive
+      Task.sleep(20.ms)
+      waiter.cancel
+    end
+    lease = leased.get || flunk("the cancelled connection was closed")
+    conn = PG::Connection.adopt(lease)
+    begin
+      assert_true(conn.listening?)
+      assert_equal(3, conn.exec("SELECT 3").rows[0].int(0))
+      PG.connect(url).then { |n| n.notify("c", "still"); n.close }
+      assert_equal("still", conn.wait_for_notify(timeout: 5.seconds)&.payload)
+    ensure
+      conn.close
+    end
+  end
+
+  def test_unlisten_stops_delivery
+    pair do |listener, notifier|
+      listener.listen("a")
+      listener.listen("b")
+      listener.unlisten("a")
+      assert_true(listener.listening?)
+      notifier.notify("a", "dropped")
+      notifier.notify("b", "kept")
+      n = listener.wait_for_notify(timeout: 5.seconds)
+      assert_equal(PG::Notification.new("b", "kept", notifier.process_id), n)
+      listener.unlisten_all
+      assert_false(listener.listening?)
+      notifier.notify("b", "dropped")
+      assert_nil(listener.wait_for_notify(timeout: 100.ms))
+      assert_equal(0, listener.exec("SELECT count(*) FROM pg_listening_channels()").rows[0].int(0))
+    end
+  end
+
+  def test_an_unlisten_in_a_transaction_leaves_listening_unsure
+    pair do |listener, _|
+      listener.listen("u")
+      listener.transaction do |tx|
+        tx.unlisten("u")
+        raise ArgumentError.new("roll back")
+      end
+    rescue ArgumentError
+      # The rollback undid the UNLISTEN.
+      assert_equal(1, listener.exec("SELECT count(*) FROM pg_listening_channels()").rows[0].int(0))
+      assert_true(listener.listening?)
+      listener.unlisten_all
+      assert_false(listener.listening?)
+    end
+  end
+
+  def test_a_lease_keeps_an_unsure_listening
+    pair do |listener, _|
+      listener.listen("a")
+      listener.listen("b")
+      begin
+        listener.transaction do |tx|
+          tx.unlisten("b")
+          raise ArgumentError.new("roll back")
+        end
+      rescue ArgumentError
+      end
+      conn = PG::Connection.adopt(listener.release || flunk("not released"))
+      begin
+        conn.unlisten("a")
+        # "b" is still listened to: the rollback undid its UNLISTEN.
+        assert_true(conn.listening?)
+      ensure
+        conn.close
+      end
+    end
+  end
+
+  def test_a_lease_keeps_the_queue_and_the_channels
+    pair do |listener, notifier|
+      listener.listen("l")
+      notifier.notify("l", "queued")
+      listener.exec("SELECT pg_sleep(0.05)")
+      listener.exec("SELECT 1")
+      lease = listener.release || flunk("not released")
+      conn = PG::Connection.adopt(lease)
+      begin
+        assert_true(conn.listening?)
+        assert_equal(["queued"], conn.notifications.map(&:payload))
+        notifier.notify("l", "next")
+        assert_equal("next", conn.wait_for_notify(timeout: 5.seconds)&.payload)
+      ensure
+        conn.close
+      end
+    end
+  end
+
+  def test_the_pool_unlistens_a_connection_given_back
+    PG::Pool.open(url, size: 1) do |pool|
+      pool.with do |c|
+        c.listen("pooled")
+        c.notify("pooled", "own")
+        c.exec("SELECT pg_sleep(0.05)")
+        c.exec("SELECT 1")
+        nil
+      end
+      pool.with do |c|
+        assert_false(c.listening?)
+        assert_equal([], c.notifications)
+        assert_equal(0, c.exec("SELECT count(*) FROM pg_listening_channels()").rows[0].int(0))
+        nil
+      end
+      # A transaction left open is rolled back first, not committed with
+      # the UNLISTEN undone.
+      pool.with do |c|
+        c.listen("pooled")
+        c.exec("BEGIN")
+        nil
+      end
+      pool.with do |c|
+        assert_equal(0, c.exec("SELECT count(*) FROM pg_listening_channels()").rows[0].int(0))
+        nil
+      end
+      nil
+    end
+  end
+
+  def test_a_notify_in_a_transaction_arrives_at_commit
+    pair do |listener, notifier|
+      listener.listen("tx")
+      notifier.transaction do |tx|
+        tx.notify("tx", "committed")
+        assert_nil(listener.wait_for_notify(timeout: 100.ms))
+      end
+      assert_equal("committed", listener.wait_for_notify(timeout: 5.seconds)&.payload)
+      begin
+        notifier.transaction do |tx|
+          tx.notify("tx", "rolled back")
+          raise ArgumentError.new("no")
+        end
+      rescue ArgumentError
+      end
+      assert_nil(listener.wait_for_notify(timeout: 100.ms))
+    end
+  end
+
+  def test_names_and_payloads
+    pair do |listener, notifier|
+      # Quoted as an identifier: case, spaces and quotes kept.
+      name = "Mixed \"Case\" name"
+      listener.listen(name)
+      listener.listen(name)
+      notifier.notify(name, "日本語 ✓")
+      n = listener.wait_for_notify(timeout: 5.seconds)
+      assert_equal(PG::Notification.new(name, "日本語 ✓", notifier.process_id), n)
+      # Listening twice delivers once.
+      assert_nil(listener.wait_for_notify(timeout: 100.ms))
+    end
+  end
+
+  def test_errors
+    pair do |listener, notifier|
+      assert_raise(ArgumentError) { listener.listen("") }
+      assert_raise(ArgumentError) { listener.listen("a\x00b") }
+      assert_raise(ArgumentError) { notifier.notify("", "x") }
+      assert_raise(ArgumentError) { listener.listen("a" * 64) }
+      assert_raise(ArgumentError) { notifier.notify("é" * 32, "x") }
+      listener.listen("a" * 63)
+      notifier.notify("a" * 63, "longest")
+      assert_equal("a" * 63, listener.wait_for_notify(timeout: 5.seconds)&.channel)
+      e = assert_raise(PG::ServerError) { notifier.notify("big", "x" * 8000) }.as(PG::ServerError)
+      assert_equal("22023", e.code)
+      assert_false(notifier.closed?)
+      notifier.close
+      assert_raise(PG::ConnectionError) { notifier.notify("x", "y") }
+      listener.close
+      assert_raise(PG::ConnectionError) { listener.wait_for_notify(timeout: 10.ms) }
+    end
+  end
+
+  def test_the_server_ending_the_session_during_a_wait
+    pair do |listener, notifier|
+      listener.listen("end")
+      notifier.query("SELECT pg_terminate_backend($1)", [listener.process_id])
+      e = assert_raise(PG::ServerError) { listener.wait_for_notify(timeout: 5.seconds) }.as(PG::ServerError)
+      assert_equal("57P01", e.code)
+      assert_true(listener.closed?)
+    end
+  end
+end

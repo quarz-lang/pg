@@ -10,6 +10,8 @@ query suspends only the task that waits for it.
 PG = { git = "https://github.com/quarz-lang/pg", tag = "v0.1.0" }
 ```
 
+The API reference of the main branch is at <https://pg.api.quarz.dev>.
+
 Work in progress. What exists:
 
 - `PG::Wire`: big-endian integers and NUL-terminated strings, and

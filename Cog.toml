@@ -2,3 +2,5 @@
 name = "pg"
 version = "0.1.0"
 module = "PG"
+documentation = "https://pg.api.quarz.dev"
+repository = "https://github.com/quarz-lang/pg"

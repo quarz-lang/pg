@@ -44,7 +44,7 @@ Work in progress. What exists:
   without verifying, and `verify-ca` and `verify-full` fail. A unix
   socket never uses TLS, whatever `sslmode` says.
 
-  ```ruby
+  ```crystal
   PG.connect("postgres://app@db.example/shop?sslmode=verify-full&sslrootcert=/etc/pg/ca.pem")
   ```
 
@@ -85,7 +85,7 @@ Work in progress. What exists:
 - `conn.transaction { |c| ... }`: BEGIN, then COMMIT, or ROLLBACK when
   the block raises; `on_notice { |fields| ... }`.
 
-```ruby
+```crystal
 conn = PG.connect("postgres://ann:secret@localhost/shop")
 conn.query("SELECT id, name FROM users WHERE id = $1", [42]).each do |row|
   puts "#{row.int("id")} #{row.string("name")}"
@@ -123,7 +123,7 @@ used any further; `PG::TransactionError` and `PG::NullError` are misuses.
   `PG::Connection#release` and `.adopt` move a single connection between
   tasks the same way.
 
-```ruby
+```crystal
 PG::Pool.open("postgres://app@localhost/shop", size: 8) do |pool|
   Task.scope do |s|
     100.times { |i| s.spawn { pool.query("INSERT INTO hits VALUES ($1)", [i]) } }
@@ -153,7 +153,7 @@ end
   task of its own and send them on a `Channel` (this runs until
   cancelled):
 
-```ruby
+```crystal
 notes = Channel[PG::Notification].new(100)
 Task.scope do |s|
   s.spawn do

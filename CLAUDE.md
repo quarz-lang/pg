@@ -27,6 +27,10 @@ The integration tests (`PG::Testing`, src/testing.qz) use `PG_TEST_URL` when it 
 directory, removed in the test class's shutdown); with neither they are
 omitted with a message.
 
+Long commands and waits (tests, builds, CI): follow the `long-jobs`
+skill (run them with `run_in_background`, keep the log and `exit=$?`,
+never use `pgrep -f` with a plain pattern).
+
 - Work on a branch and open a pull request (below); stage files by explicit path.
 - Review the branch's diff with a fresh subagent before the pull request
   leaves draft (commits on a draft are fine without it), and fix what it

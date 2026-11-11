@@ -1,5 +1,5 @@
 # Where and how to connect: what a URL or `PG.connect`'s keywords say.
-data Config = (
+data Config(
   # A host name or address, or a directory holding the server's unix
   # socket (a path starting with `/`).
   host: String,
@@ -29,6 +29,17 @@ data Config = (
   # fail, the others go unverified).
   sslrootcert: String?
 )
+  # The configuration as text, the password left out (a configuration is
+  # logged, interpolated and printed).
+  def inspect -> String
+    shown = password.nil? ? "nil" : "\"[FILTERED]\""
+    "#<PG::Config host: #{host.inspect}, port: #{port}, user: #{user.inspect}, password: #{shown}, " \
+      "database: #{database.inspect}, application_name: #{application_name.inspect}, " \
+      "sslmode: #{sslmode.inspect}, sslrootcert: #{sslrootcert.inspect}>"
+  end
+
+  def to_s -> String = inspect
+end
 
 # Reads a connection URL, as libpq does:
 # `postgres://user:password@host:port/database?param=value`
@@ -44,7 +55,10 @@ data Config = (
 # either way) and `sslnegotiation` `postgres`.
 # Client certificates (`sslcert`, `sslkey`, `sslpassword`), `sslcrl`
 # and `channel_binding=require` are not supported: they raise
-# `ArgumentError`, as does a malformed URL or an unknown parameter.
+# `ArgumentError`, as does a malformed URL or an unknown parameter. The
+# messages name what is wrong (the scheme, the user information, the
+# host or port, a parameter) and never quote the URL or a value in it,
+# which may hold a password.
 #
 # ```
 # c = PG.parse_url("postgres://ann:s%40cret@db.example:6543/shop?application_name=web")
@@ -59,8 +73,7 @@ data Config = (
 # ```
 public def parse_url(url: String) -> Config
   m = url.match(/\Apostgres(?:ql)?:\/\/(?:([^@\/?#]*)@)?(\[[^\]\/]*\]|[^:\/?#]*)(?::([0-9]*))?(?:\/([^?#]*))?(?:\?([^#]*))?\z/)
-  # The message leaves out what may be a password.
-  raise ArgumentError.new("not a postgres:// URL: #{url.sub(/\/\/[^\/]*@/, "//***@").inspect}") unless m
+  raise ArgumentError.new(Config.refusal(url)) unless m
   user: String? = nil
   password: String? = nil
   if (info = m[1])
@@ -83,7 +96,8 @@ public def parse_url(url: String) -> Config
     next if pair.empty?
     key, _, value = pair.partition("=")
     value = Config.unescape(value)
-    case Config.unescape(key)
+    name = Config.unescape(key)
+    case name
     when "host" then host = value
     when "port" then port = Config.port(value)
     when "user" then user = value
@@ -91,13 +105,13 @@ public def parse_url(url: String) -> Config
     when "dbname" then database = value
     when "application_name" then application_name = value
     when "connect_timeout"
-      raise ArgumentError.new("connect_timeout: #{value.inspect}") unless value.match?(/\A[0-9]{1,9}\z/)
+      raise ArgumentError.new("connect_timeout: not a number of seconds") unless value.match?(/\A[0-9]{1,9}\z/)
       connect_timeout = value.to_i == 0 ? nil : value.to_i.seconds
     when "max_scram_iterations"
-      raise ArgumentError.new("max_scram_iterations: #{value.inspect}") unless value.match?(/\A[1-9][0-9]{0,9}\z/)
+      raise ArgumentError.new("max_scram_iterations: not a positive number") unless value.match?(/\A[1-9][0-9]{0,9}\z/)
       max_scram_iterations = value.to_i
     when "statement_cache_size"
-      raise ArgumentError.new("statement_cache_size: #{value.inspect}") unless value.match?(/\A[0-9]{1,6}\z/)
+      raise ArgumentError.new("statement_cache_size: not a number from 0 to 999999") unless value.match?(/\A[0-9]{1,6}\z/)
       statement_cache_size = value.to_i
     when "sslmode" then sslmode = Config.sslmode(value)
     when "sslrootcert"
@@ -105,18 +119,19 @@ public def parse_url(url: String) -> Config
       sslrootcert = value
     when "channel_binding"
       unless value == "disable" || value == "prefer"
-        raise ArgumentError.new("channel_binding=#{value}: this client has no channel binding (disable or prefer only)")
+        raise ArgumentError.new("channel_binding: this client has no channel binding (disable or prefer only)")
       end
     when "sslnegotiation"
       unless value == "postgres"
-        raise ArgumentError.new("sslnegotiation=#{value}: this client negotiates TLS the postgres way only")
+        raise ArgumentError.new("sslnegotiation: this client negotiates TLS the postgres way only")
       end
     when "sslcert", "sslkey", "sslpassword"
-      raise ArgumentError.new("#{key}: this client has no client certificates")
+      raise ArgumentError.new("#{name}: this client has no client certificates")
     when "sslcrl", "sslcrldir"
-      raise ArgumentError.new("#{key}: this client does not check revocation lists")
+      raise ArgumentError.new("#{name}: this client does not check revocation lists")
     else
-      raise ArgumentError.new("unknown connection parameter #{key.inspect}")
+      # (Not quoted: a password written as a parameter is a key.)
+      raise ArgumentError.new("an unknown parameter in the URL's query (its name is not quoted: it may be a password)")
     end
   end
   Config.new(host: host.empty? ? "localhost" : host, port: port,
@@ -131,6 +146,27 @@ extension Config
   # The user's name from the environment (PGUSER, then USER), as
   # libpq takes it when a URL names none.
   def self.default_user -> String = ENV["PGUSER"]? || ENV["USER"]? || "postgres"
+
+  # Why `url` is not a connection URL, without quoting any of it (its
+  # user information may be a password that holds a `/`, `?`, `#` or
+  # `@`): the first of the scheme, a `#`, an `@` and the host or port
+  # that is wrong.
+  def self.refusal(url: String) -> String
+    unless url.match?(/\Apostgres(?:ql)?:\/\//)
+      return "not a postgres:// URL: the scheme is not postgres:// or postgresql://"
+    end
+    if url.include?("#")
+      return "not a postgres:// URL: a `#` must be written %23 (a URL fragment is not supported)"
+    end
+    # (User information that ends at an `@` before any `/`, `?` or `#`
+    # is well formed, and the host or the port is what is wrong; else
+    # an `@` further on may be the end of user information that holds
+    # one of them.)
+    if url.include?("@") && !url.match?(/\Apostgres(?:ql)?:\/\/[^@\/?#]*@/)
+      return "not a postgres:// URL: the user information is malformed, or the host or the port (a `/`, `?`, `#` or `@` in a user name or password must be written %2F, %3F, %23 or %40)"
+    end
+    "not a postgres:// URL: the host or the port is malformed"
+  end
 
   # `text` with its `%XX` escapes decoded. Raises `ArgumentError` on a
   # malformed escape or bytes that are not UTF-8.
@@ -158,7 +194,7 @@ extension Config
   # (`:verify_full`). Raises `ArgumentError` for another value.
   def self.sslmode(text: String) -> Symbol
     mode = text.tr("-", "_").to_sym
-    raise ArgumentError.new("sslmode: #{text.inspect}") unless sslmode?(mode) && !text.include?("_")
+    raise ArgumentError.new("sslmode: not one of disable, allow, prefer, require, verify-ca, verify-full") unless sslmode?(mode) && !text.include?("_")
     mode
   end
 
@@ -182,7 +218,7 @@ extension Config
 
   # A port number, 1 to 65535.
   def self.port(text: String) -> Int
-    raise ArgumentError.new("port: #{text.inspect}") unless text.match?(/\A[0-9]{1,5}\z/) && (1..65535).include?(text.to_i)
+    raise ArgumentError.new("port: not a number from 1 to 65535") unless text.match?(/\A[0-9]{1,5}\z/) && (1..65535).include?(text.to_i)
     text.to_i
   end
 end

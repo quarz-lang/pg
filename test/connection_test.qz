@@ -173,11 +173,48 @@ class ConnectionFailureTest < Test::Case
     assert_true(PG::NullError.new("x").is_a?(PG::Error))
   end
 
+  # The message of refusing `url`, which must not hold `secret`.
+  def refusal(url: String, secret: String) -> String
+    e = assert_raise(ArgumentError) { PG.parse_url(url) }
+    assert_false(e.message.include?(secret), "#{secret} in #{e.message}")
+    assert_false(e.message.include?("postgres://u"), e.message)
+    e.message
+  end
+
   def test_url_errors_hide_the_password
-    e = assert_raise(ArgumentError) { PG.parse_url("postgres://u:p#ss@h/db") }
-    assert_false(e.message.include?("p#ss"))
-    e = assert_raise(ArgumentError) { PG.parse_url("postgres://u:50%off@h/db") }
-    assert_false(e.message.include?("50%off"))
+    assert_equal("not a postgres:// URL: the user information is malformed (a `/`, `?`, `#` or `@` in the user name or password must be written %2F, %3F, %23 or %40)",
+                 refusal("postgres://u:se/cret@h/d", "cret"))
+    assert_equal("not a postgres:// URL: a `#` must be written %23 (a URL fragment is not supported)", refusal("postgres://u:p#ss@h/db", "ss"))
+    assert_true(refusal("postgres://u:se?cret@h/d", "cret").include?("user information"))
+    assert_true(refusal("postgres://u:se@cret@h:xx/d", "cret").include?("user information"))
+    assert_true(refusal("postgres://u:50%off@h/db", "50%off").include?("%-escape"))
+    assert_true(refusal("postgres://u:50%ffff@h/db", "ffff").include?("UTF-8"))
+    assert_equal("not a postgres:// URL: the scheme is not postgres:// or postgresql://", refusal("mysql://u:secret@h/d", "secret"))
+    assert_equal("not a postgres:// URL: the host or the port is malformed", refusal("postgres://h:port1/d", "port1"))
+  end
+
+  def test_parameter_errors_do_not_quote_values
+    {
+      "?port=s3cret" => "port: not a number",
+      "?connect_timeout=s3cret" => "connect_timeout: not a number",
+      "?max_scram_iterations=s3cret" => "max_scram_iterations: not a positive",
+      "?statement_cache_size=s3cret" => "statement_cache_size: not a number",
+      "?sslmode=s3cret" => "sslmode: not one of",
+      "?channel_binding=s3cret" => "channel_binding:",
+      "?sslnegotiation=s3cret" => "sslnegotiation:",
+      "?s3cret=1" => "unknown parameter",
+      "?s3cret" => "unknown parameter",
+      "?sslcert=s3cret" => "sslcert: this client has no client certificates",
+      "?sslcrl=s3cret" => "sslcrl: this client does not check"
+    }.each do |query, says|
+      m = refusal("postgres://u:pw@h/d#{query}", "s3cret")
+      assert_true(m.include?(says), "#{query}: #{m}")
+    end
+    assert_true(refusal("postgres://u:pw@h:99999/d", "99999").include?("port:"))
+  end
+
+  def test_an_empty_password_is_not_a_refusal
+    assert_equal("", PG.parse_url("postgres://u:@h/d").password)
   end
 
   def test_md5_password

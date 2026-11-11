@@ -34,7 +34,8 @@ module Wire
   # PG::Wire.cstring(Bytes::Builder.new, "user").to_bytes   # => b"user\x00"
   # ```
   def self.cstring(b: Bytes::Builder, s: String) -> Bytes::Builder
-    raise ArgumentError.new("a NUL inside #{s.inspect}") if s.include?("\0")
+    # (Not quoted: it may be a password.)
+    raise ArgumentError.new("a string with a NUL in a message to the server") if s.include?("\0")
     b << s << 0
   end
 

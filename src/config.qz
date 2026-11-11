@@ -1,5 +1,5 @@
 # Where and how to connect: what a URL or `PG.connect`'s keywords say.
-data Config = (
+data Config(
   # A host name or address, or a directory holding the server's unix
   # socket (a path starting with `/`).
   host: String,
@@ -29,6 +29,17 @@ data Config = (
   # fail, the others go unverified).
   sslrootcert: String?
 )
+  # The configuration as text, the password left out (a configuration is
+  # logged, interpolated and printed).
+  def inspect -> String
+    shown = password.nil? ? "nil" : "\"[FILTERED]\""
+    "#<PG::Config host: #{host.inspect}, port: #{port}, user: #{user.inspect}, password: #{shown}, " \
+      "database: #{database.inspect}, application_name: #{application_name.inspect}, " \
+      "sslmode: #{sslmode.inspect}, sslrootcert: #{sslrootcert.inspect}>"
+  end
+
+  def to_s -> String = inspect
+end
 
 # Reads a connection URL, as libpq does:
 # `postgres://user:password@host:port/database?param=value`
@@ -147,8 +158,12 @@ extension Config
     if url.include?("#")
       return "not a postgres:// URL: a `#` must be written %23 (a URL fragment is not supported)"
     end
-    if url.include?("@")
-      return "not a postgres:// URL: the user information is malformed (a `/`, `?`, `#` or `@` in the user name or password must be written %2F, %3F, %23 or %40)"
+    # (User information that ends at an `@` before any `/`, `?` or `#`
+    # is well formed, and the host or the port is what is wrong; else
+    # an `@` further on may be the end of user information that holds
+    # one of them.)
+    if url.include?("@") && !url.match?(/\Apostgres(?:ql)?:\/\/[^@\/?#]*@/)
+      return "not a postgres:// URL: the user information is malformed, or the host or the port (a `/`, `?`, `#` or `@` in a user name or password must be written %2F, %3F, %23 or %40)"
     end
     "not a postgres:// URL: the host or the port is malformed"
   end

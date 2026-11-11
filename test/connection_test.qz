@@ -182,11 +182,12 @@ class ConnectionFailureTest < Test::Case
   end
 
   def test_url_errors_hide_the_password
-    assert_equal("not a postgres:// URL: the user information is malformed (a `/`, `?`, `#` or `@` in the user name or password must be written %2F, %3F, %23 or %40)",
-                 refusal("postgres://u:se/cret@h/d", "cret"))
+    mixed = "not a postgres:// URL: the user information is malformed, or the host or the port (a `/`, `?`, `#` or `@` in a user name or password must be written %2F, %3F, %23 or %40)"
+    assert_equal(mixed, refusal("postgres://u:se/cret@h/d", "cret"))
     assert_equal("not a postgres:// URL: a `#` must be written %23 (a URL fragment is not supported)", refusal("postgres://u:p#ss@h/db", "ss"))
-    assert_true(refusal("postgres://u:se?cret@h/d", "cret").include?("user information"))
-    assert_true(refusal("postgres://u:se@cret@h:xx/d", "cret").include?("user information"))
+    assert_equal(mixed, refusal("postgres://u:se?cret@h/d", "cret"))
+    assert_equal("not a postgres:// URL: the host or the port is malformed", refusal("postgres://u:se@cret@h:xx/d", "cret"))
+    assert_equal("not a postgres:// URL: the host or the port is malformed", refusal("postgres://u:pw@[::1/d", "pw"))
     assert_true(refusal("postgres://u:50%off@h/db", "50%off").include?("%-escape"))
     assert_true(refusal("postgres://u:50%ffff@h/db", "ffff").include?("UTF-8"))
     assert_equal("not a postgres:// URL: the scheme is not postgres:// or postgresql://", refusal("mysql://u:secret@h/d", "secret"))
@@ -211,6 +212,21 @@ class ConnectionFailureTest < Test::Case
       assert_true(m.include?(says), "#{query}: #{m}")
     end
     assert_true(refusal("postgres://u:pw@h:99999/d", "99999").include?("port:"))
+  end
+
+  def test_a_config_shows_no_password
+    c = PG.parse_url("postgres://u:SECRETPW@h/d")
+    [c.inspect, c.to_s, "#{c}"].each do |text|
+      assert_false(text.include?("SECRETPW"), text)
+      assert_true(text.include?("[FILTERED]"))
+    end
+    assert_true(PG.parse_url("postgres://u@h/d").inspect.include?("password: nil"))
+    assert_equal("SECRETPW", c.with(port: 1).password)
+  end
+
+  def test_a_nul_in_a_credential_is_not_quoted
+    e = assert_raise(ArgumentError) { PG::Wire.cstring(Bytes::Builder.new, "SE\0CRET") }
+    assert_false(e.message.include?("SE"), e.message)
   end
 
   def test_an_empty_password_is_not_a_refusal

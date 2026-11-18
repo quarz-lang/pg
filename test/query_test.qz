@@ -124,6 +124,52 @@ class QueryTest < Test::Case
     c.exec("DROP TABLE pg_json_docs")
   end
 
+  # pg#40: `numeric` as a `Decimal`, a `Decimal` as a parameter, and
+  # `numeric[]`.
+  def test_decimals
+    c = conn
+    row = c.query("SELECT 0.1000000000000000001::numeric, 19.990::numeric, NULL::numeric, -1500::numeric, 123456789012345678901234567890.5::numeric, 0::numeric(10,2)").rows[0]
+    assert_equal("0.1000000000000000001", row.decimal(0).to_s)
+    assert_equal(3, row.decimal(1).scale)
+    assert_equal("19.990", row.decimal(1).to_s)
+    assert_nil(row.decimal?(2))
+    assert_raise(PG::NullError) { row.decimal(2) }
+    assert_equal("-1500", row.decimal(3).to_s)
+    assert_equal("123456789012345678901234567890.5", row.decimal(4).to_s)
+    assert_equal("0.00", row.decimal(5).to_s)
+    # `float` on a `numeric` column is unchanged.
+    assert_equal(0.1, row.float(0))
+    # What a Decimal cannot hold.
+    [["'NaN'::numeric", "NaN: a Decimal cannot hold it (read the column as a string)"],
+     ["'Infinity'::numeric", "Infinity: a Decimal cannot hold it (read the column as a string)"],
+     ["'-Infinity'::numeric", "-Infinity: a Decimal cannot hold it (read the column as a string)"],
+     ["1e-1001::numeric", "0.00000000000000000000000000000000000000...: a Decimal's scale is 0 to 1000 (read the column as a string)"],
+     ["(10::numeric ^ 10000)", "1000000000000000000000000000000000000000...: a Decimal has at most 10000 digits (read the column as a string)"]].each do |pair|
+      r = c.query("SELECT #{pair[0]}").rows[0]
+      e = assert_raise(ArgumentError) { r.decimal(0) }
+      assert_equal(pair[1], e.message, pair[0])
+    end
+    e = assert_raise(ArgumentError) { c.query("SELECT 'x'::text").rows[0].decimal(0) }
+    assert_equal("not a decimal: \"x\"", e.message)
+    # A parameter: cast, beside a `numeric` column, an array.
+    d = Decimal.parse("0.1000000000000000001")
+    assert_equal(["0.2000000000000000002"], c.query("SELECT ($1::numeric * 2)::text", [d]).rows.map { |r| r.string(0) })
+    c.exec("DROP TABLE IF EXISTS pg_decimals")
+    c.exec("CREATE TABLE pg_decimals (id int PRIMARY KEY, amount numeric NOT NULL)")
+    c.query("INSERT INTO pg_decimals VALUES ($1, $2), ($3, $4)", [1, d, 2, Decimal.parse("19.990")])
+    assert_equal([1], c.query("SELECT id FROM pg_decimals WHERE amount = $1", [d]).rows.map { |r| r.int(0) })
+    assert_equal([], c.query("SELECT id FROM pg_decimals WHERE amount = $1", [Decimal.parse("0.1")]).rows.map { |r| r.int(0) })
+    back = c.query("SELECT amount FROM pg_decimals WHERE id = 2").rows[0].decimal(0)
+    assert_equal("19.990", back.to_s)
+    ds: Array[Decimal?] = [d, nil, Decimal.parse("19.99")]
+    assert_equal([1, 2], c.query("SELECT id FROM pg_decimals WHERE amount = ANY($1) ORDER BY id", [ds]).rows.map { |r| r.int(0) })
+    got = c.query("SELECT $1 AS a", [ds]).rows[0].decimals("a")
+    assert_equal(["0.1000000000000000001", "nil", "19.99"], got.map { |x| x ? x.to_s : "nil" })
+    assert_equal(["numeric[]"], c.query("SELECT pg_typeof($1)::text", [[d]]).rows.map { |r| r.string(0) })
+    assert_equal(2, c.query("SELECT count(*) FROM unnest($1) AS u", [[d, d]]).rows[0].int(0))
+    c.exec("DROP TABLE pg_decimals")
+  end
+
   # pg#38: `date` as a `Date`, a `Date` as a parameter, and `date[]`.
   def test_dates
     c = conn

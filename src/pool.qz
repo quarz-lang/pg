@@ -29,6 +29,9 @@
 #   found when a connection is taken or given back. A pool nobody uses
 #   keeps them until its next use. The most recently given back is
 #   taken first, so that the others can age.
+# - Waiting calls are not served in the order they began waiting: a
+#   connection given back goes to whichever call takes it first, a new
+#   one included. `checkout_timeout` bounds each call's whole wait.
 # - `#close`, or the end of `.open`'s block, closes the idle connections
 #   and those given back later; calls waiting for one raise
 #   `PG::ConnectionError` ("pool closed").
@@ -130,6 +133,8 @@ class Pool
   end
 
   private def checkout -> Connection
+    limit = @checkout_timeout
+    deadline = limit ? Time.monotonic + limit : nil
     loop do
       raise ConnectionError.new("pool closed") if @freed.closed?
       reap
@@ -146,7 +151,7 @@ class Pool
           raise e
         end
       end
-      wait_for_token
+      wait_for_token(deadline)
     end
   end
 
@@ -160,13 +165,12 @@ class Pool
     got
   end
 
-  # Waits for a connection to be given back or dropped, at most
-  # `checkout_timeout`; returns at once when the pool closed (the caller
-  # sees it). A token left when a wait times out stays for another
-  # waiter.
-  private def wait_for_token -> Void
-    limit = @checkout_timeout
-    unless limit
+  # Waits for a connection to be given back or dropped, until `deadline`
+  # (`Time.monotonic`; nil for no limit), then raises `PoolTimeout`;
+  # returns at once when the pool closed (the caller sees it). A token
+  # left when a wait times out stays for another waiter.
+  private def wait_for_token(deadline: Duration?) -> Void
+    unless deadline
       begin
         @freed.receive
       rescue Channel::Closed
@@ -174,16 +178,19 @@ class Pool
       end
       return
     end
-    timed_out = false
-    begin
-      Channel.select do |s|
-        s.receive(@freed) { |_| nil }
-        s.after(limit) { timed_out = true }
+    left = deadline - Time.monotonic
+    timed_out = left <= 0.seconds
+    unless timed_out
+      begin
+        Channel.select do |s|
+          s.receive(@freed) { |_| nil }
+          s.after(left) { timed_out = true }
+        end
+      rescue Channel::Closed
+        return
       end
-    rescue Channel::Closed
-      return
     end
-    raise PoolTimeout.new("no connection free within #{limit}") if timed_out
+    raise PoolTimeout.new("no connection free within #{@checkout_timeout}") if timed_out
     nil
   end
 

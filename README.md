@@ -112,7 +112,7 @@ used any further; `PG::TransactionError` and `PG::NullError` are misuses.
   (26000) or says changed under it (0A000, outside a transaction) is
   prepared again and the call retried once.
 
-- `PG::Pool.open(url, size:, checkout_timeout:) { |pool| ... }` (or
+- `PG::Pool.open(url, size:, checkout_timeout:, idle_timeout:) { |pool| ... }` (or
   `PG::Pool.new` and `#close`): connections shared by tasks on any
   worker. An idle connection is kept as a Shareable `PG::Lease` (its
   socket and session state); `pool.with { |c| ... }` makes a
@@ -121,7 +121,10 @@ used any further; `PG::TransactionError` and `PG::NullError` are misuses.
   open; closed instead if it broke or a call was cut short, and replaced
   when needed). `pool.exec`, `pool.query`, `pool.transaction` are
   shortcuts. `checkout_timeout` bounds the wait for a free connection
-  (`PG::PoolTimeout`). Prepared statements stay with their connection.
+  (`PG::PoolTimeout`). A connection idle for longer than `idle_timeout`
+  (5 minutes; nil keeps them) is closed when the pool is next used, the
+  most recently given back being taken first, so the pool shrinks after
+  a burst. Prepared statements stay with their connection.
   `PG::Connection#release` and `.adopt` move a single connection between
   tasks the same way.
 

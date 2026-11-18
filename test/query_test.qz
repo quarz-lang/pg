@@ -124,6 +124,48 @@ class QueryTest < Test::Case
     c.exec("DROP TABLE pg_json_docs")
   end
 
+  # pg#38: `date` as a `Date`, a `Date` as a parameter, and `date[]`.
+  def test_dates
+    c = conn
+    row = c.query("SELECT DATE '2026-11-20', NULL::date, DATE '0001-01-01', DATE '9999-12-31', DATE '2024-02-29'").rows[0]
+    assert_equal(Date.new(2026, 11, 20), row.date(0))
+    assert_nil(row.date?(1))
+    assert_raise(PG::NullError) { row.date(1) }
+    assert_equal(Date.new(1, 1, 1), row.date(2))
+    assert_equal(Date.new(9999, 12, 31), row.date(3))
+    assert_equal(Date.new(2024, 2, 29), row.date(4))
+    # `time` on a `date` column is unchanged: midnight UTC.
+    assert_equal(Time.utc(2026, 11, 20), row.time(0))
+    # What a Date cannot hold.
+    [["'infinity'::date", "infinity: a Date cannot hold it (read the column as a string)"],
+     ["'-infinity'::date", "-infinity: a Date cannot hold it (read the column as a string)"],
+     ["DATE '10000-01-01'", "10000-01-01: a Date holds the years 1 to 9999 (read the column as a string)"],
+     ["DATE '0044-03-15 BC'", "0044-03-15 BC: a Date cannot hold a BC date (read the column as a string)"]].each do |pair|
+      r = c.query("SELECT #{pair[0]}").rows[0]
+      e = assert_raise(ArgumentError) { r.date(0) }
+      assert_equal(pair[1], e.message)
+      e = assert_raise(ArgumentError) { c.query("SELECT ARRAY[#{pair[0]}]").rows[0].dates(0) }
+      assert_equal(pair[1], e.message)
+    end
+    e = assert_raise(ArgumentError) { c.query("SELECT 'x'::text").rows[0].date(0) }
+    assert_equal("not a date: \"x\"", e.message)
+    # A parameter: cast, beside a `date` column, an array.
+    d = Date.new(2026, 11, 20)
+    assert_equal(["2026-11-21"], c.query("SELECT ($1::date + 1)::text", [d]).rows.map { |r| r.string(0) })
+    c.exec("DROP TABLE IF EXISTS pg_dates")
+    c.exec("CREATE TABLE pg_dates (id int PRIMARY KEY, day date NOT NULL)")
+    c.query("INSERT INTO pg_dates VALUES ($1, $2), ($3, $4)", [1, d, 2, Date.new(44, 3, 15)])
+    assert_equal([1], c.query("SELECT id FROM pg_dates WHERE day = $1", [d]).rows.map { |r| r.int(0) })
+    assert_equal([2], c.query("SELECT id FROM pg_dates WHERE day < $1", [d]).rows.map { |r| r.int(0) })
+    assert_equal(Date.new(44, 3, 15), c.query("SELECT day FROM pg_dates WHERE id = 2").rows[0].date(0))
+    days: Array[Date?] = [d, nil, Date.new(44, 3, 15)]
+    assert_equal([1, 2], c.query("SELECT id FROM pg_dates WHERE day = ANY($1) ORDER BY id", [days]).rows.map { |r| r.int(0) })
+    assert_equal(days, c.query("SELECT $1 AS a", [days]).rows[0].dates("a"))
+    assert_equal(["date[]"], c.query("SELECT pg_typeof($1)::text", [[d]]).rows.map { |r| r.string(0) })
+    assert_equal(2, c.query("SELECT count(*) FROM unnest($1) AS u", [[d, d]]).rows[0].int(0))
+    c.exec("DROP TABLE pg_dates")
+  end
+
   def test_nulls
     row = conn.query("SELECT NULL::int, NULL::bool, NULL::bytea").rows[0]
     assert_nil(row.int?(0))

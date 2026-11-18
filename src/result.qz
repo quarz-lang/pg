@@ -60,7 +60,8 @@ end
 # (and any integer text), `float` for float4/float8/numeric
 # (NaN, Infinity), `bool` for `t`/`f`, `bytes` for bytea's hex form,
 # `time` for timestamp, timestamptz and date (a timestamp without zone,
-# and a date at midnight, are taken as UTC), `json` for json/jsonb or
+# and a date at midnight, are taken as UTC), `date` for date (a `Date`;
+# `time` keeps reading one as a Time at midnight UTC), `json` for json/jsonb or
 # any JSON text (a `JSON::Value`), `string` for anything. Each raises
 # `PG::NullError` on NULL; its `?` form gives nil instead. A value a
 # reader cannot decode raises `ArgumentError`.
@@ -142,6 +143,17 @@ class Row
     (t = text(column)) ? Row.parse_time(t) : nil
   end
 
+  # The column's value as a Date: a `date` column's (or any text in
+  # PostgreSQL's ISO form, `2026-11-20`). What a Date cannot hold raises
+  # `ArgumentError` naming the value: `infinity`, `-infinity`, a year
+  # beyond 9999 or a BC date (read such a column as a string).
+  def date(column: Int | String) -> Date = date?(column) || null(column)
+
+  # As `#date`, nil for NULL.
+  def date?(column: Int | String) -> Date?
+    (t = text(column)) ? Row.parse_date(t) : nil
+  end
+
   # The column's text parsed as a JSON document (`JSON.parse`), a
   # `json` or `jsonb` column's, or any column's holding JSON: SQL's NULL
   # raises `PG::NullError`, while the document `null` is
@@ -202,6 +214,13 @@ class Row
 
   # As `#times`, nil for a NULL array.
   def times?(column: Int | String) -> Array[Time?]? = elements?(column) { |t| Row.parse_time(t) }
+
+  # The column's array as Dates (`date[]`), each element as `#date`
+  # reads one.
+  def dates(column: Int | String) -> Array[Date?] = dates?(column) || null(column)
+
+  # As `#dates`, nil for a NULL array.
+  def dates?(column: Int | String) -> Array[Date?]? = elements?(column) { |t| Row.parse_date(t) }
 
   # The row as a hash from column names to text values.
   def to_h -> Hash[String, String?]
@@ -332,6 +351,27 @@ class Row
              "Z"
            end
     Time.parse("#{date}T#{clock}#{zone}")
+  end
+
+  # A date in PostgreSQL's ISO output (`2026-11-20`). Raises
+  # `ArgumentError` for what a Date cannot hold (`infinity`,
+  # `-infinity`, a year beyond 9999, a BC date: `0044-03-15 BC`), or for
+  # text that is not a date.
+  #
+  # ```
+  # PG::Row.parse_date("2026-11-20")   # => 2026-11-20
+  # ```
+  def self.parse_date(text: String) -> Date
+    if text == "infinity" || text == "-infinity"
+      raise ArgumentError.new("#{text}: a Date cannot hold it (read the column as a string)")
+    end
+    if text.end_with?(" BC")
+      raise ArgumentError.new("#{text}: a Date cannot hold a BC date (read the column as a string)")
+    end
+    if text.match?(/\A\d{5,}-\d\d-\d\d\z/)
+      raise ArgumentError.new("#{text}: a Date holds the years 1 to 9999 (read the column as a string)")
+    end
+    Date.parse?(text) || raise ArgumentError.new("not a date: #{text.inspect}")
   end
 
   private def index(column: Int | String) -> Int

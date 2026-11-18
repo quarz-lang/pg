@@ -10,7 +10,9 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 # starting with `/`). A password is sent in clear only over a unix socket,
 # or when `allow_cleartext` says so. `max_scram_iterations` is the most
 # SCRAM iterations the server may ask for, `statement_cache_size` how many
-# prepared statements `PG::Connection#query` keeps.
+# prepared statements `PG::Connection#query` keeps. `options` holds server
+# settings for the session, as libpq's `options` (`-c search_path=app`),
+# which the server applies at startup (`PG::Config#options`).
 #
 # `sslmode` says whether the session goes over TLS (`PG::Connection#tls?`),
 # as libpq's does:
@@ -45,7 +47,7 @@ public def connect(*, host: String = "localhost", port: Int = 5432, user: String
                    allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
                    max_scram_iterations: Int = Scram::MAX_ITERATIONS,
                    statement_cache_size: Int = Connection::STATEMENT_CACHE_SIZE,
-                   sslmode: Symbol? = nil, sslrootcert: String? = nil) -> Connection
+                   sslmode: Symbol? = nil, sslrootcert: String? = nil, options: String? = nil) -> Connection
   if statement_cache_size < 0 || statement_cache_size > 999_999
     raise ArgumentError.new("statement_cache_size: #{statement_cache_size}")
   end
@@ -56,7 +58,7 @@ public def connect(*, host: String = "localhost", port: Int = 5432, user: String
   Connection.open(Config.new(host:, port:, user:, password:, database:, application_name:,
                              allow_cleartext:, connect_timeout:, max_scram_iterations:,
                              statement_cache_size:, sslmode: Config.sslmode(sslmode, sslrootcert),
-                             sslrootcert:))
+                             sslrootcert:, options:))
 end
 
 # Raises `ArgumentError` for a channel name the server cannot take as
@@ -841,6 +843,12 @@ class Connection
     end
     if (app = @config.application_name)
       params = params.put("application_name", app)
+    end
+    # (The server takes the parameters above over the same settings in
+    # `options`, whatever their order: the readers keep what they rely
+    # on.)
+    if (opts = @config.options)
+      params = params.put("options", opts)
     end
     send(Frontend.startup(params))
     authenticate

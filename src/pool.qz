@@ -23,41 +23,67 @@
 # - A connection given back stops listening (`UNLISTEN *`, when
 #   `PG::Connection#listening?`), and the notifications it received are
 #   dropped: a listener uses a connection of its own (`PG.connect`).
+# - A connection idle for longer than `idle_timeout` (by default 5
+#   minutes; nil keeps them) is closed, so the pool shrinks after a
+#   burst. The pool has no task of its own: the stale connections are
+#   found when a connection is taken or given back. A pool nobody uses
+#   keeps them until its next use. The most recently given back is
+#   taken first, so that the others can age.
 # - `#close`, or the end of `.open`'s block, closes the idle connections
 #   and those given back later; calls waiting for one raise
 #   `PG::ConnectionError` ("pool closed").
 class Pool
   include Shareable
 
+  # An idle connection, and when it was given back (`Time.monotonic`).
+  data Idle = (lease: Lease, since: Duration)
+
   @config: Config
   @size: Int
   @checkout_timeout: Duration?
-  # Idle connections, and nil for a connection closed instead of given
-  # back: it wakes a waiter, who may then open one.
-  @idle: Channel[Lease?]
+  @idle_timeout: Duration?
+  # The idle connections, the most recently given back last.
+  @idle: Atom[Array[Idle]]
+  # A token per connection given back or dropped: it wakes a waiter, who
+  # then takes or opens one. Closed by `#close`.
+  @freed: Channel[Nil]
   # How many connections exist, idle or in use.
   @opened: Atom[Int]
 
   # A pool of up to `size` connections to the server `url` names (see
   # `PG.connect`); close it with `#close`. `.open` closes it for you.
-  def initialize(url: String, @size: Int = 10, @checkout_timeout: Duration? = nil)
-    raise ArgumentError.new("a pool of #{size} connections") if size < 1
+  def initialize(url: String, @size: Int = 10, @checkout_timeout: Duration? = nil,
+                 @idle_timeout: Duration? = 5.minutes)
+    Pool.check(size, idle_timeout)
     @config = parse_url(url)
-    @idle = Channel[Lease?].new(size)
+    @idle = Atom[Array[Idle]].new([])
+    @freed = Channel[Nil].new(size)
     @opened = Atom[Int].new(0)
   end
 
   # As `.new(url)`, with a `PG::Config`.
-  def initialize(@config: Config, @size: Int = 10, @checkout_timeout: Duration? = nil)
-    raise ArgumentError.new("a pool of #{size} connections") if size < 1
-    @idle = Channel[Lease?].new(size)
+  def initialize(@config: Config, @size: Int = 10, @checkout_timeout: Duration? = nil,
+                 @idle_timeout: Duration? = 5.minutes)
+    Pool.check(size, idle_timeout)
+    @idle = Atom[Array[Idle]].new([])
+    @freed = Channel[Nil].new(size)
     @opened = Atom[Int].new(0)
+  end
+
+  # :nodoc:
+  def self.check(size: Int, idle_timeout: Duration?) -> Void
+    raise ArgumentError.new("a pool of #{size} connections") if size < 1
+    if idle_timeout && idle_timeout <= 0.seconds
+      raise ArgumentError.new("an idle timeout is positive, not #{idle_timeout}")
+    end
+    nil
   end
 
   # Runs the block with a new pool (see `.new`), and closes the pool when
   # the block ends. Returns the block's value.
-  def self.open[R](url: String, size: Int = 10, checkout_timeout: Duration? = nil, &: (Pool) -> R) -> R
-    pool = Pool.new(url, size:, checkout_timeout:)
+  def self.open[R](url: String, size: Int = 10, checkout_timeout: Duration? = nil,
+                   idle_timeout: Duration? = 5.minutes, &: (Pool) -> R) -> R
+    pool = Pool.new(url, size:, checkout_timeout:, idle_timeout:)
     begin
       yield pool
     ensure
@@ -93,26 +119,22 @@ class Pool
   def size -> Int = @opened.get
 
   # Whether `#close` was called.
-  def closed? -> Bool = @idle.closed?
+  def closed? -> Bool = @freed.closed?
 
   # Closes the idle connections now, and the others when they are given
   # back; later calls raise `PG::ConnectionError`. Closing again does
   # nothing.
   def close -> Void
-    @idle.close
-    # try_receive gives nil for a wake-up token too: go by emptiness.
-    until @idle.empty?
-      if (lease = @idle.try_receive)
-        discard(lease)
-      end
-    end
+    @freed.close
+    drain
   end
 
   private def checkout -> Connection
     loop do
-      raise ConnectionError.new("pool closed") if @idle.closed?
-      if (lease = @idle.try_receive)
-        return Connection.adopt(lease)
+      raise ConnectionError.new("pool closed") if @freed.closed?
+      reap
+      if (entry = take)
+        return Connection.adopt(entry.lease)
       end
       n = @opened.get
       if n < @size
@@ -124,36 +146,45 @@ class Pool
           raise e
         end
       end
-      lease = wait_for_lease
-      return Connection.adopt(lease) if lease
+      wait_for_token
     end
   end
 
-  # A lease given back, or nil when the pool closed or a connection was
-  # dropped meanwhile (then the caller may open one). The wait and its
-  # time limit are one `Channel.select`, so that a lease is never taken by
-  # a wait that then reports a timeout (it would be lost).
-  private def wait_for_lease -> Lease?
+  # The most recently given back idle connection, taken out; nil for none.
+  private def take -> Idle?
+    got: Idle? = nil
+    @idle.update do |stack|
+      got = stack.last?
+      got ? stack[0...(stack.size - 1)] : stack
+    end
+    got
+  end
+
+  # Waits for a connection to be given back or dropped, at most
+  # `checkout_timeout`; returns at once when the pool closed (the caller
+  # sees it). A token left when a wait times out stays for another
+  # waiter.
+  private def wait_for_token -> Void
     limit = @checkout_timeout
     unless limit
       begin
-        return @idle.receive
+        @freed.receive
       rescue Channel::Closed
-        return nil
+        nil
       end
+      return
     end
-    got: Lease? = nil
     timed_out = false
     begin
       Channel.select do |s|
-        s.receive(@idle) { |lease| got = lease }
+        s.receive(@freed) { |_| nil }
         s.after(limit) { timed_out = true }
       end
     rescue Channel::Closed
-      return nil
+      return
     end
     raise PoolTimeout.new("no connection free within #{limit}") if timed_out
-    got
+    nil
   end
 
   private def checkin(conn: Connection) -> Void
@@ -164,12 +195,44 @@ class Pool
       wake
       return
     end
-    sent = begin
-      @idle.try_send(lease)
-    rescue Channel::Closed
-      false
+    if @freed.closed?
+      discard(lease)
+      return
     end
-    discard(lease) unless sent
+    @idle.update { |stack| stack.push(Idle.new(lease, Time.monotonic)) }
+    # (A close since the check above has drained already: drain again.)
+    if @freed.closed?
+      drain
+      return
+    end
+    wake
+    reap
+  end
+
+  # Closes the idle connections given back longer than `idle_timeout` ago.
+  private def reap -> Void
+    limit = @idle_timeout
+    return if limit.nil?
+    cutoff = Time.monotonic - limit
+    stale: Array[Idle] = []
+    @idle.update do |stack|
+      stale = stack.select { |e| e.since <= cutoff }
+      stale.empty? ? stack : stack.reject { |e| e.since <= cutoff }
+    end
+    stale.each do |e|
+      discard(e.lease)
+      wake
+    end
+  end
+
+  # Closes every idle connection.
+  private def drain -> Void
+    taken: Array[Idle] = []
+    @idle.update do |stack|
+      taken = stack
+      Array[Idle].new
+    end
+    taken.each { |e| discard(e.lease) }
   end
 
   # A connection given back stops listening (`UNLISTEN *`, after rolling
@@ -188,9 +251,9 @@ class Pool
     conn.close
   end
 
-  # Tells a waiter, if any, that a connection may be opened.
+  # Tells a waiter, if any, that a connection may be taken or opened.
   private def wake -> Void
-    @idle.try_send(nil)
+    @freed.try_send(nil)
   rescue Channel::Closed
   end
 

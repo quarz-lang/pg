@@ -245,5 +245,60 @@ class PoolTest < Test::Case
 
   def test_bad_size
     assert_raise(ArgumentError) { PG::Pool.new(url, size: 0) }
+    assert_raise(ArgumentError) { PG::Pool.new(url, idle_timeout: 0.seconds) }
+  end
+
+  # Opens `n` connections at once (each held a moment).
+  def burst(pool: PG::Pool, n: Int) -> Void
+    Task.scope do |s|
+      n.times { s.spawn { pool.with { |_| Task.sleep(20.ms) } } }
+    end
+    nil
+  end
+
+  # Connections idle past the timeout are closed when the pool is next
+  # used; one that listened and got a notification is closed as any.
+  def test_idle_connections_are_closed
+    PG::Pool.open(url, size: 3, idle_timeout: 50.ms) do |pool: PG::Pool|
+      pool.with do |c|
+        c.listen("pool_idle")
+        c.notify("pool_idle", "x")
+        c.exec("SELECT 1")
+      end
+      burst(pool, 3)
+      assert_equal(3, pool.size)
+      Task.sleep(80.ms)
+      # The three are stale: closed, and a new one serves the query.
+      assert_equal(1, pool.exec("SELECT 1").rows[0].int(0))
+      assert_equal(1, pool.size)
+      nil
+    end
+  end
+
+  # Without a timeout, idle connections stay.
+  def test_no_idle_timeout_keeps_them
+    PG::Pool.open(url, size: 3, idle_timeout: nil) do |pool: PG::Pool|
+      burst(pool, 3)
+      Task.sleep(80.ms)
+      pool.exec("SELECT 1")
+      assert_equal(3, pool.size)
+      nil
+    end
+  end
+
+  # The most recently given back is taken first: under light steady use
+  # the others age and are closed, the pool keeps one.
+  def test_light_use_lets_the_others_age
+    PG::Pool.open(url, size: 3, idle_timeout: 100.ms) do |pool: PG::Pool|
+      burst(pool, 3)
+      pids: Array[Int] = []
+      10.times do
+        pids = pids.push(pool.with { |c| c.process_id })
+        Task.sleep(30.ms)
+      end
+      assert_equal(1, pids.uniq.size)
+      assert_equal(1, pool.size)
+      nil
+    end
   end
 end

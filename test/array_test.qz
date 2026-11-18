@@ -37,6 +37,13 @@ class ArrayTest < Test::Case
     assert_match(/a nested array at index 0/, e.message)
     e = assert_raise(ArgumentError) { enc([1.seconds]) }
     assert_match(/a parameter of class Duration/, e.message)
+    # Documents are not elements (pg#36): one variant or mixed.
+    docs: Array[Object?] = [JSON.parse("{}"), JSON.parse("{}")]
+    e = assert_raise(ArgumentError) { enc(docs) }
+    assert_match(/\Aa JSON::Value at index 0: an array of documents is not a parameter/, e.message)
+    docs = [nil, JSON.parse("[1]"), JSON.parse("null")]
+    e = assert_raise(ArgumentError) { enc(docs) }
+    assert_match(/\Aa JSON::Value at index 1: /, e.message)
   end
 
   def test_types

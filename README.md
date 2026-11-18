@@ -59,8 +59,8 @@ Work in progress. What exists:
 - `conn.exec(sql)` (simple protocol; several statements: the last
   statement's result; `exec_all` returns all of them) and `conn.query(sql, params)`
   (extended protocol, `$1`... sent apart from the SQL: nil, Int, Float,
-  String, Bool, Bytes, Time, Symbol, a `JSON::Value`, or an `Array` of
-  one of them),
+  String, Bool, Bytes, Time, Symbol or an `Array` of one of them; or a
+  `JSON::Value`),
   returning a `PG::Result`: columns, `PG::Row`s with the server's text
   (`row["name"]`) and typed readers (`int`, `float`, `string`, `bool`,
   `bytes`, `time`, `json`, each with a `?` form for NULL; for arrays
@@ -73,7 +73,8 @@ Work in progress. What exists:
   is nil for `json?` (a `PG::NullError` for `json`), the document
   `null` is `JSON::Value::Null`. A `JSON::Value` parameter is sent as
   its compact text (`JSON.generate`), which a `jsonb` column, or
-  `$1::jsonb`, takes. Numbers: a `JSON::Value` number is an `Int`, an
+  `$1::jsonb`, takes; an `Array` of them is refused (`ArgumentError`),
+  not sent as a `jsonb[]`. Numbers: a `JSON::Value` number is an `Int`, an
   exact `Integer` beyond an `Int`, or a `Float` for a fraction or an
   exponent, while `jsonb` keeps any decimal exactly; so a fraction read
   and written back may change (a `Float` keeps about 17 digits), and an

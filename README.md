@@ -59,13 +59,23 @@ Work in progress. What exists:
 - `conn.exec(sql)` (simple protocol; several statements: the last
   statement's result; `exec_all` returns all of them) and `conn.query(sql, params)`
   (extended protocol, `$1`... sent apart from the SQL: nil, Int, Float,
-  String, Bool, Bytes, Time, Date, Symbol or an `Array` of one of them;
-  or a `JSON::Value`),
+  String, Bool, Bytes, Time, Date, Decimal, Symbol or an `Array` of one
+  of them; or a `JSON::Value`),
   returning a `PG::Result`: columns, `PG::Row`s with the server's text
   (`row["name"]`) and typed readers (`int`, `float`, `string`, `bool`,
-  `bytes`, `time`, `date`, `json`, each with a `?` form for NULL; for
-  arrays `ints`, `floats`, `strings`, `bools`, `times`, `dates`),
+  `bytes`, `time`, `date`, `decimal`, `json`, each with a `?` form for
+  NULL; for arrays `ints`, `floats`, `strings`, `bools`, `times`,
+  `dates`, `decimals`),
   `command_tag`, `affected`.
+- Decimals (#40). `row.decimal(i)` reads a `numeric` column as a
+  `Decimal`, exactly and with its scale (`19.990` reads with scale 3;
+  `row.float` still reads it as a `Float`), `decimals` a `numeric[]`; a
+  `Decimal` parameter is sent as its text, which a `numeric` column or
+  `$1::numeric` takes exactly, and an `Array` of them as a `numeric[]`.
+  What a `Decimal` cannot hold raises `ArgumentError` naming the value
+  (cut to 40 characters): `NaN`, `Infinity` and `-Infinity`, and a
+  value beyond its limits (1,000 fraction digits, 10,000 digits); read
+  such a column with `string`.
 - Dates (#38). `row.date(i)` reads a `date` column as a `Date`
   (`row.time` still reads it as a `Time` at midnight UTC), `dates` a
   `date[]`; a `Date` parameter is sent as its ISO text (`2026-11-20`),

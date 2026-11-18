@@ -42,6 +42,30 @@ class ConnectionTest < Test::Case
     c.close
   end
 
+  # pg#33: libpq's `options`, from the URL or the keyword. A setting pg
+  # sends itself keeps pg's value whatever `options` says.
+  def test_options
+    config = PG.parse_url(server.url)
+    assert_nil(config.options)
+    url = server.url + (server.url.include?("?") ? "&" : "?") + "options=-c%20search_path%3Dpg_options_probe%20-c%20DateStyle%3DSQL"
+    assert_equal("-c search_path=pg_options_probe -c DateStyle=SQL", PG.parse_url(url).options)
+    c = PG.connect(url)
+    begin
+      assert_equal(["pg_options_probe"], c.query("SHOW search_path", []).rows.map { |r| r.string(0) })
+      assert_equal(["ISO, MDY"], c.query("SHOW DateStyle", []).rows.map { |r| r.string(0) })
+      assert_equal(["2026-11-18"], c.query("SELECT DATE '2026-11-18'", []).rows.map { |r| r.string(0) })
+    ensure
+      c.close
+    end
+    k = PG.connect(host: config.host, port: config.port, user: config.user, password: config.password,
+                   database: config.database, options: "-c statement_timeout=1234")
+    begin
+      assert_equal(["1234ms"], k.query("SHOW statement_timeout", []).rows.map { |r| r.string(0) })
+    ensure
+      k.close
+    end
+  end
+
   def test_unix_socket
     dir = server.socket_dir || omit("PG_TEST_URL's server: its socket is not known")
     c = PG.connect(host: dir, port: server.port, user: "quarz", password: server.password, database: "postgres")

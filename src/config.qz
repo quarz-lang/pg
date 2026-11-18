@@ -27,7 +27,13 @@ data Config(
   # path, or `system` for the system's store (nil: `~/.postgresql/root.crt`
   # when it exists; without roots, only `:verify_ca` and `:verify_full`
   # fail, the others go unverified).
-  sslrootcert: String?
+  sslrootcert: String?,
+  # Server settings for the session, sent at startup as libpq's
+  # `options` (`-c search_path=app -c statement_timeout=5s`; nil:
+  # none). A setting pg sends itself (DateStyle, client_encoding,
+  # extra_float_digits, application_name) keeps pg's value: the server
+  # takes the startup message's own parameters over these.
+  options: String? = nil
 )
   # The configuration as text, the password left out (a configuration is
   # logged, interpolated and printed).
@@ -35,7 +41,7 @@ data Config(
     shown = password.nil? ? "nil" : "\"[FILTERED]\""
     "#<PG::Config host: #{host.inspect}, port: #{port}, user: #{user.inspect}, password: #{shown}, " \
       "database: #{database.inspect}, application_name: #{application_name.inspect}, " \
-      "sslmode: #{sslmode.inspect}, sslrootcert: #{sslrootcert.inspect}>"
+      "sslmode: #{sslmode.inspect}, sslrootcert: #{sslrootcert.inspect}, options: #{options.inspect}>"
   end
 
   def to_s -> String = inspect
@@ -50,7 +56,9 @@ end
 # `statement_cache_size`, `sslmode` (`disable`, `allow`, `prefer`, the
 # default, `require`, `verify-ca` or `verify-full`: see `PG.connect`) and
 # `sslrootcert` (a PEM file's path, or `system`, which makes `sslmode`
-# `verify-full` unless given, and refuses a weaker one) are read.
+# `verify-full` unless given, and refuses a weaker one) and `options`
+# (server settings for the session, `-c name=value` each, as libpq
+# sends them: `Config#options`) are read.
 # `channel_binding` may be `disable` or `prefer` (no channel binding
 # either way) and `sslnegotiation` `postgres`.
 # Client certificates (`sslcert`, `sslkey`, `sslpassword`), `sslcrl`
@@ -92,6 +100,7 @@ public def parse_url(url: String) -> Config
   statement_cache_size = Connection::STATEMENT_CACHE_SIZE
   sslmode: Symbol? = nil
   sslrootcert: String? = nil
+  options: String? = nil
   (m[5] || "").split("&").each do |pair|
     next if pair.empty?
     key, _, value = pair.partition("=")
@@ -121,6 +130,7 @@ public def parse_url(url: String) -> Config
       unless value == "disable" || value == "prefer"
         raise ArgumentError.new("channel_binding: this client has no channel binding (disable or prefer only)")
       end
+    when "options" then options = value
     when "sslnegotiation"
       unless value == "postgres"
         raise ArgumentError.new("sslnegotiation: this client negotiates TLS the postgres way only")
@@ -139,7 +149,8 @@ public def parse_url(url: String) -> Config
              application_name: application_name, allow_cleartext: false,
              connect_timeout: connect_timeout, max_scram_iterations: max_scram_iterations,
              statement_cache_size: statement_cache_size,
-             sslmode: Config.sslmode(sslmode, sslrootcert), sslrootcert: sslrootcert)
+             sslmode: Config.sslmode(sslmode, sslrootcert), sslrootcert: sslrootcert,
+             options: options)
 end
 
 extension Config

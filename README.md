@@ -25,6 +25,12 @@ Work in progress. What exists:
   SCRAM-SHA-256 (`PG::Scram`), md5, cleartext (over a unix socket, or
   with `allow_cleartext: true`) or trust, `connect_timeout`. Server
   errors raise `PG::ServerError` (SQLSTATE `code`, `detail`, `hint`, ...).
+  `options` (keyword or URL parameter, as libpq's) sends server
+  settings for the session at startup:
+  `?options=-c%20search_path%3Dapp` or `options: "-c statement_timeout=5s"`.
+  The settings pg sends itself (`DateStyle`, `client_encoding`,
+  `extra_float_digits`, `application_name`) keep pg's values: the server
+  takes the startup message's own parameters over `options`.
 
 - TLS over TCP, through Quarz's `TLSSocket` (rustls), as `sslmode`
   (keyword or URL parameter) says; `conn.tls?` tells.

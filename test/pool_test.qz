@@ -235,6 +235,44 @@ class PoolTest < Test::Case
     end
   end
 
+  # A connect that fails wakes a call that began waiting while it was in
+  # flight: that call opens its own (failing too) instead of waiting out
+  # its `checkout_timeout` (#31).
+  def test_a_failed_connect_wakes_a_waiter
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.local_address.port
+    # Accepts, then closes after 100 ms: a connect that is slow, then fails.
+    Task.spawn do
+      2.times do
+        c = server.accept
+        Task.sleep(100.ms)
+        c.close
+      end
+      nil
+    end
+    PG::Pool.open("postgres://u@127.0.0.1:#{port}/db", size: 1, checkout_timeout: 2.seconds) do |pool: PG::Pool|
+      Task.scope do |s|
+        first = s.spawn do
+          begin
+            pool.exec("SELECT 1")
+            "served"
+          rescue PG::ConnectionError
+            "refused"
+          end
+        end
+        Task.sleep(20.ms)
+        start = Time.monotonic
+        assert_raise(PG::ConnectionError) { pool.exec("SELECT 1") }
+        waited = (Time.monotonic - start).to_ms
+        assert_true(waited < 1000, "waited #{waited} ms")
+        assert_equal("refused", first.await)
+      end
+      assert_equal(0, pool.size)
+      nil
+    end
+    server.close
+  end
+
   def test_unreachable_server
     PG::Pool.open("postgres://u@127.0.0.1:1/db", size: 1) do |pool|
       assert_raise(PG::ConnectionError) { pool.exec("SELECT 1") }

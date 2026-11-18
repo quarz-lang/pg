@@ -385,12 +385,14 @@ class Row
     if text == "NaN" || text == "Infinity" || text == "-Infinity"
       raise ArgumentError.new("#{text}: a Decimal cannot hold it (read the column as a string)")
     end
-    begin
-      Decimal.parse?(text) || raise ArgumentError.new("not a decimal: #{Row.shown(text).inspect}")
-    rescue ArgumentError => e
-      raise e if e.message.start_with?("not a decimal: ")
-      raise ArgumentError.new("#{Row.shown(text)}: #{e.message.sub(/: ".*\z/m, "")} (read the column as a string)")
-    end
+    # (`parse?` raises only past a limit: the value shown, with its
+    # reason; nil is text that is not a decimal.)
+    d = begin
+          Decimal.parse?(text)
+        rescue ArgumentError => e
+          raise ArgumentError.new("#{Row.shown(text)}: #{e.message.sub(/: ".*\z/m, "")} (read the column as a string)")
+        end
+    d || raise ArgumentError.new("not a decimal: #{Row.shown(text).inspect}")
   end
 
   # `text`, cut to 40 characters (an error names a value of 10,000

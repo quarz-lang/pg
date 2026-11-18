@@ -147,7 +147,10 @@ class Pool
         begin
           return Connection.open(@config)
         rescue Exception => e
+          # (A call that began waiting while this open was in flight may
+          # now open one itself.)
           @opened.update { |k| k - 1 }
+          wake
           raise e
         end
       end

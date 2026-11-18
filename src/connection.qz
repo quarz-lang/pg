@@ -658,8 +658,11 @@ class Connection
            in Symbol => s then s.to_s
            in Bytes => b then return "\\x#{b.hex}".to_bytes
            in Time => t then t.utc.iso8601(6)
+           # (A document: its compact text, which a `jsonb` or `json`
+           # column, or `$1::jsonb`, takes.)
+           in JSON::Value => v then JSON.generate(v)
            else raise ArgumentError.new("a parameter of class #{value.class.name}: " +
-                                        "give nil, Int, Float, String, Bool, Bytes, Time, Symbol or an Array of one of them")
+                                        "give nil, Int, Float, String, Bool, Bytes, Time, Symbol, JSON::Value or an Array of one of them")
            end
     text.to_bytes
   end

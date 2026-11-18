@@ -93,6 +93,37 @@ class QueryTest < Test::Case
     assert_equal(PG::Types::TIMESTAMPTZ, r.columns[0].type)
   end
 
+  # pg#36: json and jsonb as `JSON::Value`s, and a `JSON::Value` as a
+  # parameter.
+  def test_json
+    c = conn
+    row = c.query("SELECT '{\"a\": [1, 2.5, \"x\"]}'::jsonb, '{\"b\":  null}'::json, 'null'::jsonb, NULL::jsonb, '123456789012345678901234567890'::jsonb, '0.1'::jsonb").rows[0]
+    assert_equal(JSON.parse("{\"a\": [1, 2.5, \"x\"]}"), row.json(0))
+    assert_equal(JSON.parse("{\"b\": null}"), row.json(1))
+    # The document `null` is not SQL's NULL.
+    assert(row.json(2) == JSON::Value::Null, row.json(2).inspect)
+    assert_nil(row.json?(3))
+    assert_raise(PG::NullError) { row.json(3) }
+    # A big integer kept exact; a decimal fraction as a Float.
+    assert_equal("123456789012345678901234567890", JSON.generate(row.json(4)))
+    assert_equal(0.1, row.json(5).as_f)
+    # Any column's text: a `text` holding JSON reads, one that does not
+    # raises ArgumentError, the parse error its cause.
+    assert_equal(JSON.parse("[1]"), c.query("SELECT '[1]'::text").rows[0].json(0))
+    e = assert_raise(ArgumentError) { c.query("SELECT 'not json'::text").rows[0].json(0) }
+    assert_match(/\Acolumn 0 is not JSON: /, e.message)
+    assert(e.cause.is_a?(JSON::ParseError))
+    # A parameter: beside a jsonb column, and cast.
+    c.exec("DROP TABLE IF EXISTS pg_json_docs")
+    c.exec("CREATE TABLE pg_json_docs (id int PRIMARY KEY, body jsonb NOT NULL)")
+    doc = JSON.parse("{\"k\": {\"n\": [true, null, 3]}, \"s\": \"\\u00e9\"}")
+    c.query("INSERT INTO pg_json_docs VALUES ($1, $2)", [1, doc])
+    assert_equal(doc, c.query("SELECT body FROM pg_json_docs WHERE id = $1", [1]).rows[0].json(0))
+    assert_equal([1], c.query("SELECT id FROM pg_json_docs WHERE body @> $1::jsonb", [JSON.parse("{\"k\": {}}")]).rows.map { |r| r.int(0) })
+    assert_equal(["3"], c.query("SELECT ($1::jsonb #>> '{k,n,2}')", [doc]).rows.map { |r| r.string(0) })
+    c.exec("DROP TABLE pg_json_docs")
+  end
+
   def test_nulls
     row = conn.query("SELECT NULL::int, NULL::bool, NULL::bytea").rows[0]
     assert_nil(row.int?(0))

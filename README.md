@@ -59,11 +59,25 @@ Work in progress. What exists:
 - `conn.exec(sql)` (simple protocol; several statements: the last
   statement's result; `exec_all` returns all of them) and `conn.query(sql, params)`
   (extended protocol, `$1`... sent apart from the SQL: nil, Int, Float,
-  String, Bool, Bytes, Time, Symbol, or an `Array` of one of them),
+  String, Bool, Bytes, Time, Symbol, a `JSON::Value`, or an `Array` of
+  one of them),
   returning a `PG::Result`: columns, `PG::Row`s with the server's text
   (`row["name"]`) and typed readers (`int`, `float`, `string`, `bool`,
-  `bytes`, `time`, each with a `?` form for NULL; for arrays `ints`,
-  `floats`, `strings`, `bools`, `times`), `command_tag`, `affected`.
+  `bytes`, `time`, `json`, each with a `?` form for NULL; for arrays
+  `ints`, `floats`, `strings`, `bools`, `times`), `command_tag`,
+  `affected`.
+- JSON (#36). `row.json(i)` reads a `json` or `jsonb` column (or any
+  column holding JSON text) as a `JSON::Value` (`JSON.parse` of the text
+  the server sends; text that is not JSON raises `ArgumentError`, as the
+  other readers do for a value they cannot decode): SQL's NULL
+  is nil for `json?` (a `PG::NullError` for `json`), the document
+  `null` is `JSON::Value::Null`. A `JSON::Value` parameter is sent as
+  its compact text (`JSON.generate`), which a `jsonb` column, or
+  `$1::jsonb`, takes. Numbers: a `JSON::Value` number is an `Int`, an
+  exact `Integer` beyond an `Int`, or a `Float` for a fraction or an
+  exponent, while `jsonb` keeps any decimal exactly; so a fraction read
+  and written back may change (a `Float` keeps about 17 digits), and an
+  integer of any size is kept.
   After an error the connection stays usable.
 - Arrays. An `Array` parameter is one parameter, a one-dimensional
   PostgreSQL array in text format (`{1,2,3}`, `{"b,c",NULL}`), however

@@ -60,9 +60,10 @@ end
 # (and any integer text), `float` for float4/float8/numeric
 # (NaN, Infinity), `bool` for `t`/`f`, `bytes` for bytea's hex form,
 # `time` for timestamp, timestamptz and date (a timestamp without zone,
-# and a date at midnight, are taken as UTC), `string` for anything. Each
-# raises `PG::NullError` on NULL; its `?` form gives nil instead. A value
-# a reader cannot decode raises `ArgumentError`.
+# and a date at midnight, are taken as UTC), `json` for json/jsonb or
+# any JSON text (a `JSON::Value`), `string` for anything. Each raises
+# `PG::NullError` on NULL; its `?` form gives nil instead. A value a
+# reader cannot decode raises `ArgumentError`.
 class Row
   include Shareable
 
@@ -139,6 +140,27 @@ class Row
   # As `#time`, nil for NULL.
   def time?(column: Int | String) -> Time?
     (t = text(column)) ? Row.parse_time(t) : nil
+  end
+
+  # The column's text parsed as a JSON document (`JSON.parse`), a
+  # `json` or `jsonb` column's, or any column's holding JSON: SQL's NULL
+  # raises `PG::NullError`, while the document `null` is
+  # `JSON::Value::Null`. Raises `ArgumentError` for text that is not JSON,
+  # as the readers do for a value they cannot decode (the
+  # `JSON::ParseError` its cause). A number becomes an `Int`, an exact `Integer`
+  # beyond an `Int`, or a `Float` for a fraction or an exponent: `jsonb`
+  # keeps any decimal exactly, so a fraction read and written back may
+  # change (`0.1` stays `0.1`, a fraction of 20 digits does not).
+  def json(column: Int | String) -> JSON::Value = json?(column) || null(column)
+
+  # As `#json`, nil for SQL's NULL.
+  def json?(column: Int | String) -> JSON::Value?
+    t = text(column) || return nil
+    begin
+      JSON.parse(t)
+    rescue JSON::ParseError => e
+      raise ArgumentError.new("column #{column.inspect} is not JSON: #{e.message}")
+    end
   end
 
   # The column's array as Ints (a NULL element as nil). Raises

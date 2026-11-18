@@ -59,13 +59,20 @@ Work in progress. What exists:
 - `conn.exec(sql)` (simple protocol; several statements: the last
   statement's result; `exec_all` returns all of them) and `conn.query(sql, params)`
   (extended protocol, `$1`... sent apart from the SQL: nil, Int, Float,
-  String, Bool, Bytes, Time, Symbol or an `Array` of one of them; or a
-  `JSON::Value`),
+  String, Bool, Bytes, Time, Date, Symbol or an `Array` of one of them;
+  or a `JSON::Value`),
   returning a `PG::Result`: columns, `PG::Row`s with the server's text
   (`row["name"]`) and typed readers (`int`, `float`, `string`, `bool`,
-  `bytes`, `time`, `json`, each with a `?` form for NULL; for arrays
-  `ints`, `floats`, `strings`, `bools`, `times`), `command_tag`,
-  `affected`.
+  `bytes`, `time`, `date`, `json`, each with a `?` form for NULL; for
+  arrays `ints`, `floats`, `strings`, `bools`, `times`, `dates`),
+  `command_tag`, `affected`.
+- Dates (#38). `row.date(i)` reads a `date` column as a `Date`
+  (`row.time` still reads it as a `Time` at midnight UTC), `dates` a
+  `date[]`; a `Date` parameter is sent as its ISO text (`2026-11-20`),
+  which a `date` column or `$1::date` takes, and an `Array` of them as
+  a `date[]`. What a `Date` cannot hold raises `ArgumentError` naming
+  the value: `infinity` and `-infinity`, a year beyond 9999, a BC date
+  (`0044-03-15 BC`); read such a column with `string`.
 - JSON (#36). `row.json(i)` reads a `json` or `jsonb` column (or any
   column holding JSON text) as a `JSON::Value` (`JSON.parse` of the text
   the server sends; text that is not JSON raises `ArgumentError`, as the

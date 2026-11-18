@@ -658,8 +658,11 @@ class Connection
            in Symbol => s then s.to_s
            in Bytes => b then return "\\x#{b.hex}".to_bytes
            in Time => t then t.utc.iso8601(6)
+           # (A document: its compact text, which a `jsonb` or `json`
+           # column, or `$1::jsonb`, takes.)
+           in JSON::Value => v then JSON.generate(v)
            else raise ArgumentError.new("a parameter of class #{value.class.name}: " +
-                                        "give nil, Int, Float, String, Bool, Bytes, Time, Symbol or an Array of one of them")
+                                        "give nil, Int, Float, String, Bool, Bytes, Time, Symbol or an Array of one of them; or a JSON::Value")
            end
     text.to_bytes
   end
@@ -706,6 +709,8 @@ class Connection
       case x
       in nil then nil
       in Array then raise ArgumentError.new("a nested array at index #{i}: array parameters are one-dimensional")
+      # (Not an element: a `JSON::Value` is a parameter of its own.)
+      in JSON::Value then raise ArgumentError.new("a JSON::Value at index #{i}: an array of documents is not a parameter (send one document, or a jsonb array: a JSON::Value::Array)")
       else
         if f = first
           unless x.class == f

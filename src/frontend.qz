@@ -1,5 +1,5 @@
 # The messages a client sends, encoded as the server reads them. Each
-# function returns the whole message, framed (`PG::Wire.frame`).
+# function returns the whole message, framed ([PG::Wire.frame]).
 module Frontend
   # Protocol 3.0, as the startup message names it.
   PROTOCOL = 196608
@@ -104,7 +104,7 @@ module Frontend
   def self.describe_portal(name: String) -> Bytes = describe('P'.ord, name)
 
   # Runs the portal, returning at most `max_rows` rows (0: all of them).
-  # Raises `ArgumentError` when `max_rows` is negative or beyond 2^31 - 1.
+  # Raises [ArgumentError] when `max_rows` is negative or beyond 2^31 - 1.
   def self.execute(portal: String, max_rows: Int = 0) -> Bytes
     raise ArgumentError.new("max_rows out of range: #{max_rows}") if max_rows < 0 || max_rows > 0x7fff_ffff
     b = Wire.cstring(Bytes::Builder.new, portal)

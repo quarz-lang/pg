@@ -1,5 +1,5 @@
 # The root of every error this cog raises: `rescue PG::Error` catches
-# them all. (An argument a method cannot take is an `ArgumentError`, as
+# them all. (An argument a method cannot take is an [ArgumentError], as
 # anywhere.)
 class Error < StandardError
 end
@@ -10,7 +10,7 @@ end
 class ServerError < Error
   @fields: Hash[String, String]
 
-  # An error with the server's `fields`.
+  # An error with the server's [fields].
   def initialize(@fields: Hash[String, String])
     super(ServerError.describe(fields))
   end
@@ -62,7 +62,7 @@ end
 
 # The client cannot authenticate as the server asks, or the server's side
 # of the exchange did not check out. (A server that refuses the
-# credentials reports a `PG::ServerError`, SQLSTATE 28P01.)
+# credentials reports a [PG::ServerError], SQLSTATE 28P01.)
 class AuthenticationError < ConnectionError
 end
 
@@ -70,10 +70,10 @@ end
 class NullError < Error
 end
 
-# `PG::Connection#transaction` was called inside a transaction.
+# [PG::Connection#transaction] was called inside a transaction.
 class TransactionError < Error
 end
 
-# No connection of a `PG::Pool` was free within its `checkout_timeout`.
+# No connection of a [PG::Pool] was free within its `checkout_timeout`.
 class PoolTimeout < Error
 end

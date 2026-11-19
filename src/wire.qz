@@ -1,9 +1,9 @@
 # The byte level of PostgreSQL's protocol (version 3): big-endian integers
-# and NUL-terminated strings, written into a `Bytes::Builder` and read
-# from `Bytes`.
+# and NUL-terminated strings, written into a [Bytes::Builder] and read
+# from [Bytes].
 module Wire
   # Appends `n` as a big-endian 16-bit integer (its two's complement when
-  # negative). Raises `ArgumentError` when `n` does not fit in 16 bits,
+  # negative). Raises [ArgumentError] when `n` does not fit in 16 bits,
   # signed or unsigned.
   #
   # ```
@@ -16,7 +16,7 @@ module Wire
   end
 
   # Appends `n` as a big-endian 32-bit integer (its two's complement when
-  # negative). Raises `ArgumentError` when `n` does not fit in 32 bits,
+  # negative). Raises [ArgumentError] when `n` does not fit in 32 bits,
   # signed or unsigned.
   #
   # ```
@@ -27,7 +27,7 @@ module Wire
     b << ((n >> 24) & 0xff) << ((n >> 16) & 0xff) << ((n >> 8) & 0xff) << (n & 0xff)
   end
 
-  # Appends `s`'s UTF-8 bytes and a NUL. Raises `ArgumentError` when `s`
+  # Appends `s`'s UTF-8 bytes and a NUL. Raises [ArgumentError] when `s`
   # holds a NUL itself, which would end it early.
   #
   # ```
@@ -54,7 +54,7 @@ module Wire
   end
 
   # Reads big-endian integers, NUL-terminated strings and byte runs from
-  # `Bytes`, front to back. Reading past the end raises `PG::ProtocolError`.
+  # [Bytes], front to back. Reading past the end raises [PG::ProtocolError].
   class Reader
     @data: Bytes
     var @pos: Int = 0
@@ -122,7 +122,7 @@ module Wire
     end
 
     # The next NUL-terminated string, without its NUL, decoded as UTF-8
-    # (an invalid sequence raises `PG::ProtocolError`).
+    # (an invalid sequence raises [PG::ProtocolError]).
     #
     # ```
     # PG::Wire::Reader.new(b"ab\x00c\x00").cstring   # => "ab"
@@ -170,12 +170,12 @@ class MessageReader
     @read = ->(n: Int) { io.read_bytes(n) }
   end
 
-  # Reads with `read`, which gives up to its argument's count of bytes
+  # Reads with [read], which gives up to its argument's count of bytes
   # and nothing at the end of the stream.
   def initialize(@read: (Int) -> Bytes); end
 
-  # The next message. Raises `PG::ConnectionError` when the stream ends,
-  # and `PG::ProtocolError` for a message that does not parse.
+  # The next message. Raises [PG::ConnectionError] when the stream ends,
+  # and [PG::ProtocolError] for a message that does not parse.
   def read -> Backend
     header = Wire::Reader.new(exactly(5))
     type = header.byte

@@ -22,7 +22,7 @@ class Scram
   MAX_ITERATIONS = 1_000_000
 
   # Above this many rounds, the hashing runs on a helper thread
-  # (`Task.blocking`), so that the worker's other tasks go on meanwhile.
+  # ([Task.blocking]), so that the worker's other tasks go on meanwhile.
   BLOCKING_ITERATIONS = 10_000
 
   @password: String
@@ -46,7 +46,7 @@ class Scram
   def client_first -> String = "n,,#{first_bare}"
 
   # The final message, answering the server's first message. Raises
-  # `PG::AuthenticationError` when that message is malformed or its nonce
+  # [PG::AuthenticationError] when that message is malformed or its nonce
   # does not extend this client's.
   def client_final(server_first: String) -> String
     attrs = attributes(server_first)
@@ -73,7 +73,7 @@ class Scram
   end
 
   # Checks the server's final message, which proves that the server knows
-  # the password too. Raises `PG::AuthenticationError` when it does not,
+  # the password too. Raises [PG::AuthenticationError] when it does not,
   # or reports an error (`e=`).
   def verify(server_final: String) -> Void
     expected = @server_signature || fail("the final message before the client's")
@@ -86,7 +86,7 @@ class Scram
     @verified = true
   end
 
-  # Whether `#verify` checked the server's signature: until then the
+  # Whether [#verify] checked the server's signature: until then the
   # server has not proved that it knows the password.
   def verified? -> Bool = @verified
 

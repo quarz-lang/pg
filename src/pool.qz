@@ -1,6 +1,6 @@
 # Connections shared by many tasks, on any worker. An idle connection is
-# kept as a `PG::Lease` (its socket and its session's state, Shareable);
-# a task that needs one takes a lease and makes a `PG::Connection` of it
+# kept as a [PG::Lease] (its socket and its session's state, Shareable);
+# a task that needs one takes a lease and makes a [PG::Connection] of it
 # in its own task, and gives it back when done.
 #
 #     PG::Pool.open("postgres://app@localhost/shop", size: 8) do |pool|
@@ -12,17 +12,17 @@
 #
 # The rules:
 #
-# - Connections are opened when needed, up to `size`. A call waits for a
+# - Connections are opened when needed, up to [size]. A call waits for a
 #   free one at most `checkout_timeout` when it is given (then it raises
-#   `PG::PoolTimeout`); the work itself is not bounded by it.
+#   [PG::PoolTimeout]); the work itself is not bounded by it.
 # - The work runs in the caller's task, and its exceptions are the
 #   caller's. When it returns, the connection goes back to the pool if it
 #   is idle (a transaction the work left open is rolled back first);
 #   otherwise (broken, or a call cut short by cancellation or a timeout)
 #   it is closed, and the pool opens another when one is needed.
 # - A connection given back stops listening (`UNLISTEN *`, when
-#   `PG::Connection#listening?`), and the notifications it received are
-#   dropped: a listener uses a connection of its own (`PG.connect`).
+#   [PG::Connection#listening?]), and the notifications it received are
+#   dropped: a listener uses a connection of its own ([PG.connect]).
 # - A connection idle for longer than `idle_timeout` (by default 5
 #   minutes; nil keeps them) is closed, so the pool shrinks after a
 #   burst. The pool has no task of its own: the stale connections are
@@ -32,13 +32,13 @@
 # - Waiting calls are not served in the order they began waiting: a
 #   connection given back goes to whichever call takes it first, a new
 #   one included. `checkout_timeout` bounds each call's whole wait.
-# - `#close`, or the end of `.open`'s block, closes the idle connections
+# - [#close], or the end of [.open]'s block, closes the idle connections
 #   and those given back later; calls waiting for one raise
-#   `PG::ConnectionError` ("pool closed").
+#   [PG::ConnectionError] ("pool closed").
 class Pool
   include Shareable
 
-  # An idle connection, and when it was given back (`Time.monotonic`).
+  # An idle connection, and when it was given back ([Time.monotonic]).
   data Idle = (lease: Lease, since: Duration)
 
   @config: Config
@@ -53,8 +53,8 @@ class Pool
   # How many connections exist, idle or in use.
   @opened: Atom[Int]
 
-  # A pool of up to `size` connections to the server `url` names (see
-  # `PG.connect`); close it with `#close`. `.open` closes it for you.
+  # A pool of up to [size] connections to the server `url` names (see
+  # [PG.connect]); close it with [#close]. [.open] closes it for you.
   def initialize(url: String, @size: Int = 10, @checkout_timeout: Duration? = nil,
                  @idle_timeout: Duration? = 5.minutes)
     Pool.check(size, idle_timeout)
@@ -64,7 +64,7 @@ class Pool
     @opened = Atom[Int].new(0)
   end
 
-  # As `.new(url)`, with a `PG::Config`.
+  # As `.new(url)`, with a [PG::Config].
   def initialize(@config: Config, @size: Int = 10, @checkout_timeout: Duration? = nil,
                  @idle_timeout: Duration? = 5.minutes)
     Pool.check(size, idle_timeout)
@@ -82,7 +82,7 @@ class Pool
     nil
   end
 
-  # Runs the block with a new pool (see `.new`), and closes the pool when
+  # Runs the block with a new pool (see [.new]), and closes the pool when
   # the block ends. Returns the block's value.
   def self.open[R](url: String, size: Int = 10, checkout_timeout: Duration? = nil,
                    idle_timeout: Duration? = 5.minutes, &: (Pool) -> R) -> R
@@ -96,7 +96,7 @@ class Pool
 
   # Runs the block with a connection of the pool, in the calling task, and
   # returns its value (see the class's rules). The connection is the
-  # pool's: a block that calls its `PG::Connection#release` takes it out
+  # pool's: a block that calls its [PG::Connection#release] takes it out
   # of the pool.
   def with[R](&: (Connection) -> R) -> R
     conn = checkout
@@ -107,13 +107,13 @@ class Pool
     end
   end
 
-  # `PG::Connection#exec` on a connection of the pool.
+  # [PG::Connection#exec] on a connection of the pool.
   def exec(sql: String) -> Result = with { |c| c.exec(sql) }
 
-  # `PG::Connection#query` on a connection of the pool.
+  # [PG::Connection#query] on a connection of the pool.
   def query(sql: String, params: Array[Object?] = []) -> Result = with { |c| c.query(sql, params) }
 
-  # `PG::Connection#transaction` on a connection of the pool.
+  # [PG::Connection#transaction] on a connection of the pool.
   def transaction[R](&: (Connection) -> R) -> R
     with { |c| c.transaction { |tx| yield tx } }
   end
@@ -121,11 +121,11 @@ class Pool
   # How many connections are open, idle or in use.
   def size -> Int = @opened.get
 
-  # Whether `#close` was called.
+  # Whether [#close] was called.
   def closed? -> Bool = @freed.closed?
 
   # Closes the idle connections now, and the others when they are given
-  # back; later calls raise `PG::ConnectionError`. Closing again does
+  # back; later calls raise [PG::ConnectionError]. Closing again does
   # nothing.
   def close -> Void
     @freed.close

@@ -14,17 +14,17 @@ The API reference of the main branch is at <https://pg.api.quarz.dev>.
 
 Work in progress. What exists:
 
-- `PG::Wire`: big-endian integers and NUL-terminated strings, and
-  `PG::MessageReader`, which reads one backend message at a time.
-- `PG::Frontend`: the messages a client sends (startup, password and
+- [PG::Wire]: big-endian integers and NUL-terminated strings, and
+  [PG::MessageReader], which reads one backend message at a time.
+- [PG::Frontend]: the messages a client sends (startup, password and
   SASL, simple and extended queries, sync, terminate).
-- `PG::Backend`: the messages a server sends, decoded into an enum.
+- [PG::Backend]: the messages a server sends, decoded into an enum.
 
 - `PG.connect(url)` / `PG.connect(host:, port:, user:, password:, ...)`:
   TCP or a unix socket (a `host` starting with `/`), authentication by
-  SCRAM-SHA-256 (`PG::Scram`), md5, cleartext (over a unix socket, or
+  SCRAM-SHA-256 ([PG::Scram]), md5, cleartext (over a unix socket, or
   with `allow_cleartext: true`) or trust, `connect_timeout`. Server
-  errors raise `PG::ServerError` (SQLSTATE `code`, `detail`, `hint`, ...).
+  errors raise [PG::ServerError] (SQLSTATE `code`, `detail`, `hint`, ...).
   `options` (keyword or URL parameter, as libpq's) sends server
   settings for the session at startup:
   `?options=-c%20search_path%3Dapp` or `options: "-c statement_timeout=5s"`.
@@ -32,7 +32,7 @@ Work in progress. What exists:
   `extra_float_digits`, `application_name`) keep pg's values: the server
   takes the startup message's own parameters over `options`.
 
-- TLS over TCP, through Quarz's `TLSSocket` (rustls), as `sslmode`
+- TLS over TCP, through Quarz's [TLSSocket] (rustls), as `sslmode`
   (keyword or URL parameter) says; `conn.tls?` tells.
 
   | `sslmode` | |
@@ -40,12 +40,12 @@ Work in progress. What exists:
   | `disable` | plain |
   | `allow` | plain; when the server refuses the session (`hostssl` only), once more over TLS |
   | `prefer` (the default) | TLS when the server speaks it, else plain |
-  | `require` | TLS, else `PG::ConnectionError` |
+  | `require` | TLS, else [PG::ConnectionError] |
   | `verify-ca`, `verify-full` | TLS, the server's certificate and name verified |
 
   `sslrootcert` names the roots: a PEM file, or `system` for the
   system's store (then `sslmode` is `verify-full` unless given, and a
-  weaker one than `verify-ca` is an `ArgumentError`). Without it,
+  weaker one than `verify-ca` is an [ArgumentError]). Without it,
   `~/.postgresql/root.crt` is read when it exists. With roots, `allow`,
   `prefer` and `require` verify the server as `verify-full` does (so a
   stale `root.crt` makes `require` fail); without them they encrypt
@@ -59,49 +59,49 @@ Work in progress. What exists:
 - `conn.exec(sql)` (simple protocol; several statements: the last
   statement's result; `exec_all` returns all of them) and `conn.query(sql, params)`
   (extended protocol, `$1`... sent apart from the SQL: nil, Int, Float,
-  String, Bool, Bytes, Time, Date, Decimal, Symbol or an `Array` of one
-  of them; or a `JSON::Value`),
-  returning a `PG::Result`: columns, `PG::Row`s with the server's text
+  String, Bool, Bytes, Time, Date, Decimal, Symbol or an [Array] of one
+  of them; or a [JSON::Value]),
+  returning a [PG::Result]: columns, [PG::Row]s with the server's text
   (`row["name"]`) and typed readers (`int`, `float`, `string`, `bool`,
   `bytes`, `time`, `date`, `decimal`, `json`, each with a `?` form for
   NULL; for arrays `ints`, `floats`, `strings`, `bools`, `times`,
   `dates`, `decimals`),
   `command_tag`, `affected`.
 - Decimals (#40). `row.decimal(i)` reads a `numeric` column as a
-  `Decimal`, exactly and with its scale (`19.990` reads with scale 3;
-  `row.float` still reads it as a `Float`), `decimals` a `numeric[]`; a
-  `Decimal` parameter is sent as its text, which a `numeric` column or
-  `$1::numeric` takes exactly, and an `Array` of them as a `numeric[]`.
-  What a `Decimal` cannot hold raises `ArgumentError` naming the value
+  [Decimal], exactly and with its scale (`19.990` reads with scale 3;
+  `row.float` still reads it as a [Float]), `decimals` a `numeric[]`; a
+  [Decimal] parameter is sent as its text, which a `numeric` column or
+  `$1::numeric` takes exactly, and an [Array] of them as a `numeric[]`.
+  What a [Decimal] cannot hold raises [ArgumentError] naming the value
   (cut to 40 characters): `NaN`, `Infinity` and `-Infinity`, and a
   value beyond its limits (1,000 fraction digits, 10,000 digits); read
   such a column with `string`.
-- Dates (#38). `row.date(i)` reads a `date` column as a `Date`
-  (`row.time` still reads it as a `Time` at midnight UTC), `dates` a
-  `date[]`; a `Date` parameter is sent as its ISO text (`2026-11-20`),
-  which a `date` column or `$1::date` takes, and an `Array` of them as
-  a `date[]`. What a `Date` cannot hold raises `ArgumentError` naming
+- Dates (#38). `row.date(i)` reads a `date` column as a [Date]
+  (`row.time` still reads it as a [Time] at midnight UTC), `dates` a
+  `date[]`; a [Date] parameter is sent as its ISO text (`2026-11-20`),
+  which a `date` column or `$1::date` takes, and an [Array] of them as
+  a `date[]`. What a [Date] cannot hold raises [ArgumentError] naming
   the value: `infinity` and `-infinity`, a year beyond 9999, a BC date
   (`0044-03-15 BC`); read such a column with `string`.
 - JSON (#36). `row.json(i)` reads a `json` or `jsonb` column (or any
-  column holding JSON text) as a `JSON::Value` (`JSON.parse` of the text
-  the server sends; text that is not JSON raises `ArgumentError`, as the
+  column holding JSON text) as a [JSON::Value] ([JSON.parse] of the text
+  the server sends; text that is not JSON raises [ArgumentError], as the
   other readers do for a value they cannot decode): SQL's NULL
-  is nil for `json?` (a `PG::NullError` for `json`), the document
-  `null` is `JSON::Value::Null`. A `JSON::Value` parameter is sent as
-  its compact text (`JSON.generate`), which a `jsonb` column, or
-  `$1::jsonb`, takes; an `Array` of them is refused (`ArgumentError`),
-  not sent as a `jsonb[]`. Numbers: a `JSON::Value` number is an `Int`, an
-  exact `Integer` beyond an `Int`, or a `Float` for a fraction or an
+  is nil for `json?` (a [PG::NullError] for `json`), the document
+  `null` is [JSON::Value::Null]. A [JSON::Value] parameter is sent as
+  its compact text ([JSON.generate]), which a `jsonb` column, or
+  `$1::jsonb`, takes; an [Array] of them is refused ([ArgumentError]),
+  not sent as a `jsonb[]`. Numbers: a [JSON::Value] number is an [Int], an
+  exact [Integer] beyond an [Int], or a [Float] for a fraction or an
   exponent, while `jsonb` keeps any decimal exactly; so a fraction read
-  and written back may change (a `Float` keeps about 17 digits), and an
+  and written back may change (a [Float] keeps about 17 digits), and an
   integer of any size is kept.
   After an error the connection stays usable.
-- Arrays. An `Array` parameter is one parameter, a one-dimensional
+- Arrays. An [Array] parameter is one parameter, a one-dimensional
   PostgreSQL array in text format (`{1,2,3}`, `{"b,c",NULL}`), however
   long: `WHERE id = ANY($1)` with 70,000 ids is one parameter and one
   prepared statement, not 70,000 (the protocol's limit is 65535
-  parameters). Its elements are of one class (`ArgumentError` for mixed
+  parameters). Its elements are of one class ([ArgumentError] for mixed
   classes or a nested array) and nil is NULL. Its type:
 
   | Elements | Sent as | A bare `unnest($1)`, `SELECT $1` |
@@ -120,7 +120,7 @@ Work in progress. What exists:
   session's time zone). Scalar parameters are untyped, as before. The
   array readers return
   `Array[T?]` (NULL elements as nil), with a `?` form for a NULL array;
-  an array of more than one dimension raises `ArgumentError` (`row[...]`
+  an array of more than one dimension raises [ArgumentError] (`row[...]`
   gives its text).
 - `conn.transaction { |c| ... }`: BEGIN, then COMMIT, or ROLLBACK when
   the block raises; `on_notice { |fields| ... }`.
@@ -133,12 +133,12 @@ end
 conn.close
 ```
 
-Errors: `PG::Error` is the root of every error the cog raises.
-`PG::ServerError` is what the server reported (SQLSTATE `code`,
+Errors: [PG::Error] is the root of every error the cog raises.
+[PG::ServerError] is what the server reported (SQLSTATE `code`,
 `detail`, `hint`, `position`; a refused login included, 28P01 for a wrong
-password); `PG::ConnectionError` (with `PG::AuthenticationError` and
-`PG::ProtocolError` under it) means the connection failed or cannot be
-used any further; `PG::TransactionError` and `PG::NullError` are misuses.
+password); [PG::ConnectionError] (with [PG::AuthenticationError] and
+[PG::ProtocolError] under it) means the connection failed or cannot be
+used any further; [PG::TransactionError] and [PG::NullError] are misuses.
 
 
 - `query` prepares each SQL text once per element types of its array
@@ -151,19 +151,19 @@ used any further; `PG::TransactionError` and `PG::NullError` are misuses.
   prepared again and the call retried once.
 
 - `PG::Pool.open(url, size:, checkout_timeout:, idle_timeout:) { |pool| ... }` (or
-  `PG::Pool.new` and `#close`): connections shared by tasks on any
-  worker. An idle connection is kept as a Shareable `PG::Lease` (its
+  [PG::Pool.new] and `#close`): connections shared by tasks on any
+  worker. An idle connection is kept as a Shareable [PG::Lease] (its
   socket and session state); `pool.with { |c| ... }` makes a
-  `PG::Connection` of one in the calling task, runs an ordinary block,
+  [PG::Connection] of one in the calling task, runs an ordinary block,
   and gives it back (rolled back first if the block left a transaction
   open; closed instead if it broke or a call was cut short, and replaced
   when needed). `pool.exec`, `pool.query`, `pool.transaction` are
   shortcuts. `checkout_timeout` bounds the wait for a free connection
-  (`PG::PoolTimeout`). A connection idle for longer than `idle_timeout`
+  ([PG::PoolTimeout]). A connection idle for longer than `idle_timeout`
   (5 minutes; nil keeps them) is closed when the pool is next used, the
   most recently given back being taken first, so the pool shrinks after
   a burst. Prepared statements stay with their connection.
-  `PG::Connection#release` and `.adopt` move a single connection between
+  [PG::Connection#release] and `.adopt` move a single connection between
   tasks the same way.
 
 ```crystal
@@ -178,22 +178,22 @@ end
   identifier), `unlisten(channel)`, `unlisten_all`, `listening?`, and
   `notify(channel, payload = "")` (`pg_notify`; delivered at commit
   inside a transaction; a payload under 8000 bytes). A channel name has
-  1 to 63 bytes (`ArgumentError` otherwise).
+  1 to 63 bytes ([ArgumentError] otherwise).
   `conn.wait_for_notify(timeout: 5.seconds)` gives the next
-  `PG::Notification` (`channel`, `payload`, the notifier's
+  [PG::Notification] (`channel`, `payload`, the notifier's
   `process_id`), or nil at the timeout (`nil` waits without limit).
   Notifications that arrive while the connection runs queries are
   queued, in order: `wait_for_notify` takes those first, and
   `conn.notifications` takes them all without reading the socket. The
-  queue and the channels go with a `PG::Lease`.
+  queue and the channels go with a [PG::Lease].
 
-  The wait suspends only its task, and `Task.timeout` and `cancel`
+  The wait suspends only its task, and [Task.timeout] and `cancel`
   interrupt it. It waits for the socket to be readable before reading a
   message, so an interruption between messages (nearly always) leaves
   the connection usable; one in the middle of a message closes it, as
   for a query cut short. A connection is one task's, so to hand
   notifications to other tasks, listen on a connection of its own in a
-  task of its own and send them on a `Channel` (this runs until
+  task of its own and send them on a [Channel] (this runs until
   cancelled):
 
 ```crystal
@@ -221,16 +221,16 @@ end
 ```
 
   Listen with `listen`, not `exec("LISTEN ...")`, which is not tracked.
-  `PG::Pool` sends `UNLISTEN *` on a connection given back that
+  [PG::Pool] sends `UNLISTEN *` on a connection given back that
   `listening?`, and drops what it received: use a dedicated
-  `PG.connect` for a listener.
+  [PG.connect] for a listener.
 
-- `PG::Testing`, for the tests of a program or cog that uses pg:
+- [PG::Testing], for the tests of a program or cog that uses pg:
   `PG::Testing.with_cluster { |url| ... }` runs the block against
   `PG_TEST_URL`'s server when that is set, or else a throwaway cluster
   made with PostgreSQL's own programs (`initdb`, `pg_ctl`) in a
-  temporary directory, removed afterwards; `PG::Testing::Unavailable`
-  when there is neither. `PG::Testing.start` and `start_or_reason`
+  temporary directory, removed afterwards; [PG::Testing::Unavailable]
+  when there is neither. [PG::Testing.start] and `start_or_reason`
   keep one server for a test class (`startup`/`shutdown`, omitting the
   tests when there is none). Given `certificate:` and `private_key:`
   (PEM), the cluster is always a throwaway one, with TLS on.
@@ -257,7 +257,7 @@ For now, to be revisited:
   revocation lists (`sslcrl`), no channel binding (`channel_binding`
   may be `disable` or `prefer`, and the client uses SCRAM-SHA-256 even
   when the server offers SCRAM-SHA-256-PLUS), no direct TLS negotiation
-  (`sslnegotiation=postgres` only): the others raise `ArgumentError`.
+  (`sslnegotiation=postgres` only): the others raise [ArgumentError].
 - With `prefer`, a server that agrees to TLS and then fails the
   handshake (a stale `root.crt` included) is an error (libpq tries
   again in plain).
@@ -267,7 +267,7 @@ For now, to be revisited:
 ## Development
 
 `quarz test` runs the tests, `quarz test --doc` the documentation's
-examples. The integration tests use `PG::Testing`: `PG_TEST_URL` when it
+examples. The integration tests use [PG::Testing]: `PG_TEST_URL` when it
 is set; otherwise, where PostgreSQL's server programs are installed
 (`/usr/lib/postgresql/*/bin`), a throwaway cluster in a temporary
 directory (SCRAM-SHA-256, a random port on 127.0.0.1), removed

@@ -1,4 +1,4 @@
-# Where and how to connect: what a URL or `PG.connect`'s keywords say.
+# Where and how to connect: what a URL or [PG.connect]'s keywords say.
 data Config(
   # A host name or address, or a directory holding the server's unix
   # socket (a path starting with `/`).
@@ -14,13 +14,13 @@ data Config(
   allow_cleartext: Bool,
   # How long connecting and authenticating may take (nil: no limit).
   connect_timeout: Duration?,
-  # The most SCRAM iterations the server may ask for (`PG::Scram`).
+  # The most SCRAM iterations the server may ask for ([PG::Scram]).
   max_scram_iterations: Int,
-  # How many prepared statements `PG::Connection#query` keeps (0: none,
+  # How many prepared statements [PG::Connection#query] keeps (0: none,
   # as a pooler in transaction mode needs).
   statement_cache_size: Int,
   # Whether and how TLS is used over TCP: `:disable`, `:allow`,
-  # `:prefer`, `:require`, `:verify_ca` or `:verify_full` (`PG.connect`
+  # `:prefer`, `:require`, `:verify_ca` or `:verify_full` ([PG.connect]
   # says what each does). A unix socket never uses TLS.
   sslmode: Symbol,
   # The roots the server's certificate is verified against: a PEM file's
@@ -29,7 +29,7 @@ data Config(
   # fail, the others go unverified).
   sslrootcert: String?,
   # Server settings for the session, sent at startup as libpq's
-  # `options` (`-c search_path=app -c statement_timeout=5s`; nil:
+  # [options] (`-c search_path=app -c statement_timeout=5s`; nil:
   # none). A setting pg sends itself (DateStyle, client_encoding,
   # extra_float_digits, application_name) keeps pg's value: the server
   # takes the startup message's own parameters over these.
@@ -54,16 +54,16 @@ end
 # the parameters `host`, `port`, `user`, `password`, `dbname`,
 # `application_name`, `connect_timeout` (seconds), `max_scram_iterations`,
 # `statement_cache_size`, `sslmode` (`disable`, `allow`, `prefer`, the
-# default, `require`, `verify-ca` or `verify-full`: see `PG.connect`) and
+# default, `require`, `verify-ca` or `verify-full`: see [PG.connect]) and
 # `sslrootcert` (a PEM file's path, or `system`, which makes `sslmode`
 # `verify-full` unless given, and refuses a weaker one) and `options`
 # (server settings for the session, `-c name=value` each, as libpq
-# sends them: `Config#options`) are read.
+# sends them: [Config#options]) are read.
 # `channel_binding` may be `disable` or `prefer` (no channel binding
 # either way) and `sslnegotiation` `postgres`.
 # Client certificates (`sslcert`, `sslkey`, `sslpassword`), `sslcrl`
 # and `channel_binding=require` are not supported: they raise
-# `ArgumentError`, as does a malformed URL or an unknown parameter. The
+# [ArgumentError], as does a malformed URL or an unknown parameter. The
 # messages name what is wrong (the scheme, the user information, the
 # host or port, a parameter) and never quote the URL or a value in it,
 # which may hold a password.
@@ -179,7 +179,7 @@ extension Config
     "not a postgres:// URL: the host or the port is malformed"
   end
 
-  # `text` with its `%XX` escapes decoded. Raises `ArgumentError` on a
+  # `text` with its `%XX` escapes decoded. Raises [ArgumentError] on a
   # malformed escape or bytes that are not UTF-8.
   def self.unescape(text: String) -> String
     return text unless text.include?("%")
@@ -202,7 +202,7 @@ extension Config
   end
 
   # The `sslmode` a URL spells (`verify-full`), as a Symbol
-  # (`:verify_full`). Raises `ArgumentError` for another value.
+  # (`:verify_full`). Raises [ArgumentError] for another value.
   def self.sslmode(text: String) -> Symbol
     mode = text.tr("-", "_").to_sym
     raise ArgumentError.new("sslmode: not one of disable, allow, prefer, require, verify-ca, verify-full") unless sslmode?(mode) && !text.include?("_")
@@ -211,7 +211,7 @@ extension Config
 
   # The `sslmode` of a connection given `mode` (nil: none given) and
   # `rootcert`: `:prefer` by default, `:verify_full` with the system's
-  # roots, with which a weaker mode raises `ArgumentError` (libpq 16).
+  # roots, with which a weaker mode raises [ArgumentError] (libpq 16).
   def self.sslmode(mode: Symbol?, rootcert: String?) -> Symbol
     return mode || :prefer unless rootcert == "system"
     m = mode || :verify_full

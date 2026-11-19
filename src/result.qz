@@ -7,7 +7,7 @@ class Result
   @rows: Array[Row]
   @command_tag: String
 
-  # A result of `rows` with `columns`, as the server tagged it.
+  # A result of [rows] with [columns], as the server tagged it.
   def initialize(@columns: Array[Field], @rows: Array[Row], @command_tag: String); end
 
   # The columns, in order.
@@ -56,23 +56,23 @@ end
 # readers on top. A column is named by its index from 0 or by its name
 # (the first column of that name).
 #
-# The readers decode PostgreSQL's text format: `int` for int2/int4/int8
-# (and any integer text), `float` for float4/float8/numeric
-# (NaN, Infinity), `bool` for `t`/`f`, `bytes` for bytea's hex form,
-# `time` for timestamp, timestamptz and date (a timestamp without zone,
-# and a date at midnight, are taken as UTC), `decimal` for numeric (a
-# `Decimal`, the scale kept), `date` for date (a `Date`;
-# `time` keeps reading one as a Time at midnight UTC), `json` for json/jsonb or
-# any JSON text (a `JSON::Value`), `string` for anything. Each raises
-# `PG::NullError` on NULL; its `?` form gives nil instead. A value a
-# reader cannot decode raises `ArgumentError`.
+# The readers decode PostgreSQL's text format: [int] for int2/int4/int8
+# (and any integer text), [float] for float4/float8/numeric
+# (NaN, Infinity), [bool] for `t`/`f`, [bytes] for bytea's hex form,
+# [time] for timestamp, timestamptz and date (a timestamp without zone,
+# and a date at midnight, are taken as UTC), [decimal] for numeric (a
+# [Decimal], the scale kept), [date] for date (a [Date];
+# [time] keeps reading one as a Time at midnight UTC), [json] for json/jsonb or
+# any JSON text (a [JSON::Value]), [string] for anything. Each raises
+# [PG::NullError] on NULL; its `?` form gives nil instead. A value a
+# reader cannot decode raises [ArgumentError].
 class Row
   include Shareable
 
   @columns: Array[Field]
   @values: Array[Bytes?]
 
-  # A row of `values`, one per column of `columns`.
+  # A row of `values`, one per column of [columns].
   def initialize(@columns: Array[Field], @values: Array[Bytes?]); end
 
   # The columns.
@@ -81,7 +81,7 @@ class Row
   # The number of columns.
   def size -> Int = @values.size
 
-  # The column's text, or nil for NULL. Raises `IndexError` for a column
+  # The column's text, or nil for NULL. Raises [IndexError] for a column
   # the row does not have.
   def [](column: Int | String) -> String?
     raw(column)&.decode
@@ -90,7 +90,7 @@ class Row
   # The column's value as an Int.
   def int(column: Int | String) -> Int = int?(column) || null(column)
 
-  # As `#int`, nil for NULL.
+  # As [#int], nil for NULL.
   def int?(column: Int | String) -> Int?
     (t = text(column)) ? Row.parse_int(t) : nil
   end
@@ -98,7 +98,7 @@ class Row
   # The column's value as a Float.
   def float(column: Int | String) -> Float = float?(column) || null(column)
 
-  # As `#float`, nil for NULL.
+  # As [#float], nil for NULL.
   def float?(column: Int | String) -> Float?
     (t = text(column)) ? Row.parse_float(t) : nil
   end
@@ -106,7 +106,7 @@ class Row
   # The column's value as text.
   def string(column: Int | String) -> String = string?(column) || null(column)
 
-  # As `#string`, nil for NULL.
+  # As [#string], nil for NULL.
   def string?(column: Int | String) -> String? = self[column]
 
   # The column's value as a Bool.
@@ -115,7 +115,7 @@ class Row
     v.nil? ? null(column) : v
   end
 
-  # As `#bool`, nil for NULL.
+  # As [#bool], nil for NULL.
   def bool?(column: Int | String) -> Bool?
     case text(column)
     in nil then nil
@@ -129,7 +129,7 @@ class Row
   # bytes for another type.
   def bytes(column: Int | String) -> Bytes = bytes?(column) || null(column)
 
-  # As `#bytes`, nil for NULL.
+  # As [#bytes], nil for NULL.
   def bytes?(column: Int | String) -> Bytes?
     v = raw(column)
     return nil unless v
@@ -139,46 +139,46 @@ class Row
   # The column's value as a Time.
   def time(column: Int | String) -> Time = time?(column) || null(column)
 
-  # As `#time`, nil for NULL.
+  # As [#time], nil for NULL.
   def time?(column: Int | String) -> Time?
     (t = text(column)) ? Row.parse_time(t) : nil
   end
 
-  # The column's value as a Date: a `date` column's (or any text in
+  # The column's value as a Date: a [date] column's (or any text in
   # PostgreSQL's ISO form, `2026-11-20`). What a Date cannot hold raises
-  # `ArgumentError` naming the value: `infinity`, `-infinity`, a year
+  # [ArgumentError] naming the value: `infinity`, `-infinity`, a year
   # beyond 9999 or a BC date (read such a column as a string).
   def date(column: Int | String) -> Date = date?(column) || null(column)
 
-  # As `#date`, nil for NULL.
+  # As [#date], nil for NULL.
   def date?(column: Int | String) -> Date?
     (t = text(column)) ? Row.parse_date(t) : nil
   end
 
   # The column's value as a Decimal: a `numeric` column's (or any text
   # in its form), its scale kept (`19.990` reads with scale 3). What a
-  # Decimal cannot hold raises `ArgumentError` naming the value: NaN,
+  # Decimal cannot hold raises [ArgumentError] naming the value: NaN,
   # Infinity, -Infinity, a value beyond its limits (1,000 fraction
   # digits, 10,000 digits); read such a column as a string.
   def decimal(column: Int | String) -> Decimal = decimal?(column) || null(column)
 
-  # As `#decimal`, nil for NULL.
+  # As [#decimal], nil for NULL.
   def decimal?(column: Int | String) -> Decimal?
     (t = text(column)) ? Row.parse_decimal(t) : nil
   end
 
-  # The column's text parsed as a JSON document (`JSON.parse`), a
-  # `json` or `jsonb` column's, or any column's holding JSON: SQL's NULL
-  # raises `PG::NullError`, while the document `null` is
-  # `JSON::Value::Null`. Raises `ArgumentError` for text that is not JSON,
+  # The column's text parsed as a JSON document ([JSON.parse]), a
+  # [json] or `jsonb` column's, or any column's holding JSON: SQL's NULL
+  # raises [PG::NullError], while the document `null` is
+  # [JSON::Value::Null]. Raises [ArgumentError] for text that is not JSON,
   # as the readers do for a value they cannot decode (the
-  # `JSON::ParseError` its cause). A number becomes an `Int`, an exact `Integer`
-  # beyond an `Int`, or a `Float` for a fraction or an exponent: `jsonb`
+  # [JSON::ParseError] its cause). A number becomes an [Int], an exact [Integer]
+  # beyond an [Int], or a [Float] for a fraction or an exponent: `jsonb`
   # keeps any decimal exactly, so a fraction read and written back may
   # change (`0.1` stays `0.1`, a fraction of 20 digits does not).
   def json(column: Int | String) -> JSON::Value = json?(column) || null(column)
 
-  # As `#json`, nil for SQL's NULL.
+  # As [#json], nil for SQL's NULL.
   def json?(column: Int | String) -> JSON::Value?
     t = text(column) || return nil
     begin
@@ -189,29 +189,29 @@ class Row
   end
 
   # The column's array as Ints (a NULL element as nil). Raises
-  # `ArgumentError` for an array of more than one dimension, as the
+  # [ArgumentError] for an array of more than one dimension, as the
   # readers do for text that is not their type.
   def ints(column: Int | String) -> Array[Int?] = ints?(column) || null(column)
 
-  # As `#ints`, nil for a NULL array.
+  # As [#ints], nil for a NULL array.
   def ints?(column: Int | String) -> Array[Int?]? = elements?(column) { |t| Row.parse_int(t) }
 
   # The column's array as Floats.
   def floats(column: Int | String) -> Array[Float?] = floats?(column) || null(column)
 
-  # As `#floats`, nil for a NULL array.
+  # As [#floats], nil for a NULL array.
   def floats?(column: Int | String) -> Array[Float?]? = elements?(column) { |t| Row.parse_float(t) }
 
   # The column's array as text.
   def strings(column: Int | String) -> Array[String?] = strings?(column) || null(column)
 
-  # As `#strings`, nil for a NULL array.
+  # As [#strings], nil for a NULL array.
   def strings?(column: Int | String) -> Array[String?]? = elements?(column) { |t| t }
 
   # The column's array as Bools.
   def bools(column: Int | String) -> Array[Bool?] = bools?(column) || null(column)
 
-  # As `#bools`, nil for a NULL array.
+  # As [#bools], nil for a NULL array.
   def bools?(column: Int | String) -> Array[Bool?]?
     elements?(column) do |t|
       case t
@@ -225,21 +225,21 @@ class Row
   # The column's array as Times.
   def times(column: Int | String) -> Array[Time?] = times?(column) || null(column)
 
-  # As `#times`, nil for a NULL array.
+  # As [#times], nil for a NULL array.
   def times?(column: Int | String) -> Array[Time?]? = elements?(column) { |t| Row.parse_time(t) }
 
   # The column's array as Decimals (`numeric[]`), each element as
-  # `#decimal` reads one.
+  # [#decimal] reads one.
   def decimals(column: Int | String) -> Array[Decimal?] = decimals?(column) || null(column)
 
-  # As `#decimals`, nil for a NULL array.
+  # As [#decimals], nil for a NULL array.
   def decimals?(column: Int | String) -> Array[Decimal?]? = elements?(column) { |t| Row.parse_decimal(t) }
 
-  # The column's array as Dates (`date[]`), each element as `#date`
+  # The column's array as Dates (`date[]`), each element as [#date]
   # reads one.
   def dates(column: Int | String) -> Array[Date?] = dates?(column) || null(column)
 
-  # As `#dates`, nil for a NULL array.
+  # As [#dates], nil for a NULL array.
   def dates?(column: Int | String) -> Array[Date?]? = elements?(column) { |t| Row.parse_date(t) }
 
   # The row as a hash from column names to text values.
@@ -275,7 +275,7 @@ class Row
 
   # An array's text output (`{1,NULL,"a b"}`) as its elements' text, nil
   # for NULL: quoted elements unescaped. Elements are separated by `,`,
-  # as for every built-in type but `box` (whose arrays use `;`). Raises `ArgumentError` for an
+  # as for every built-in type but `box` (whose arrays use `;`). Raises [ArgumentError] for an
   # array of more than one dimension or with explicit bounds
   # (`[0:1]={1,2}`).
   #
@@ -374,7 +374,7 @@ class Row
   end
 
   # A `numeric` in PostgreSQL's output (`19.990`, `-0.5`, `1500`), its
-  # scale kept. Raises `ArgumentError` naming the value for what a
+  # scale kept. Raises [ArgumentError] naming the value for what a
   # Decimal cannot hold (NaN, Infinity, -Infinity, a value beyond
   # its limits) or for text that is not a decimal.
   #
@@ -400,7 +400,7 @@ class Row
   def self.shown(text: String) -> String = text.size > 40 ? text[0, 40] + "..." : text
 
   # A date in PostgreSQL's ISO output (`2026-11-20`). Raises
-  # `ArgumentError` for what a Date cannot hold (`infinity`,
+  # [ArgumentError] for what a Date cannot hold (`infinity`,
   # `-infinity`, a year beyond 9999, a BC date: `0044-03-15 BC`), or for
   # text that is not a date.
   #

@@ -72,7 +72,7 @@ enum Backend
   variant NegotiateProtocolVersion(minor: Int, options: Array[String])
 
   # The message of type `type` (its byte) with the body `body`. Raises
-  # `PG::ProtocolError` for a type this client does not know (COPY's
+  # [PG::ProtocolError] for a type this client does not know (COPY's
   # among them, for now) or a body that does not parse.
   #
   # ```

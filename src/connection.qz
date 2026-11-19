@@ -1,7 +1,7 @@
-# Connects to the server `url` names (`PG.parse_url` reads it), and
-# authenticates. Raises `PG::ServerError` when the server refuses (a wrong
-# password, a missing database), `PG::AuthenticationError` when this
-# client cannot authenticate as the server asks, and `PG::ConnectionError`
+# Connects to the server `url` names ([PG.parse_url] reads it), and
+# authenticates. Raises [PG::ServerError] when the server refuses (a wrong
+# password, a missing database), [PG::AuthenticationError] when this
+# client cannot authenticate as the server asks, and [PG::ConnectionError]
 # when the server cannot be reached or does not answer in time.
 public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 
@@ -10,11 +10,11 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 # starting with `/`). A password is sent in clear only over a unix socket,
 # or when `allow_cleartext` says so. `max_scram_iterations` is the most
 # SCRAM iterations the server may ask for, `statement_cache_size` how many
-# prepared statements `PG::Connection#query` keeps. `options` holds server
+# prepared statements [PG::Connection#query] keeps. `options` holds server
 # settings for the session, as libpq's `options` (`-c search_path=app`),
-# which the server applies at startup (`PG::Config#options`).
+# which the server applies at startup ([PG::Config#options]).
 #
-# `sslmode` says whether the session goes over TLS (`PG::Connection#tls?`),
+# `sslmode` says whether the session goes over TLS ([PG::Connection#tls?]),
 # as libpq's does:
 #
 # - `:disable`: never.
@@ -22,7 +22,7 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 #   `pg_hba.conf` that takes only `hostssl`), once more over TLS.
 # - `:prefer` (the default, unless `sslrootcert` is `"system"`): over
 #   TLS when the server speaks it, else in plain.
-# - `:require`: over TLS, else `PG::ConnectionError`.
+# - `:require`: over TLS, else [PG::ConnectionError].
 # - `:verify_ca`, `:verify_full`: over TLS, the server's certificate
 #   verified against the roots `sslrootcert` names, its name too (the
 #   host as given, a name or an address). `:verify_ca` is `:verify_full`
@@ -30,9 +30,9 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 #
 # `sslrootcert` is a PEM file's path, or `"system"` for the system's
 # store; nil means `~/.postgresql/root.crt`, read only when it exists
-# (`:verify_ca` and `:verify_full` raise `PG::ConnectionError` when it
+# (`:verify_ca` and `:verify_full` raise [PG::ConnectionError] when it
 # does not). With `"system"`, `sslmode` is `:verify_full` unless given,
-# and a weaker one (`:disable` to `:require`) raises `ArgumentError`, as
+# and a weaker one (`:disable` to `:require`) raises [ArgumentError], as
 # in libpq.
 #
 # With `:allow`, `:prefer` and `:require`, the server is verified (as
@@ -41,7 +41,7 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 # session is encrypted but the server not authenticated. So a stale
 # `root.crt` makes `:require` fail. A unix socket (`host` starting with `/`)
 # never uses TLS, whatever `sslmode` says. A TLS failure (a certificate
-# refused, a handshake that fails) is a `PG::ConnectionError` saying why.
+# refused, a handshake that fails) is a [PG::ConnectionError] saying why.
 public def connect(*, host: String = "localhost", port: Int = 5432, user: String = Config.default_user,
                    password: String? = nil, database: String? = nil, application_name: String? = nil,
                    allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
@@ -70,15 +70,15 @@ def check_channel(name: String) -> Void
   raise ArgumentError.new("a channel name of #{name.bytesize} bytes: 63 at most") if name.bytesize > 63
 end
 
-# A NOTIFY on a channel the connection listens to (`PG::Connection#listen`):
+# A NOTIFY on a channel the connection listens to ([PG::Connection#listen]):
 # the channel, the payload (`""` when none was given) and the server
-# process that sent it (`PG::Connection#process_id` on the notifier's side).
+# process that sent it ([PG::Connection#process_id] on the notifier's side).
 data Notification = (channel: String, payload: String, process_id: Int)
 
 # What a connection is made of, as a Shareable value: its socket and the
 # session's state, so that it can move to another task, which makes a
-# `PG::Connection` of it again (`PG::Connection#release`,
-# `PG::Connection.adopt`). `PG::Pool` keeps its idle connections so.
+# [PG::Connection] of it again ([PG::Connection#release],
+# [PG::Connection.adopt]). [PG::Pool] keeps its idle connections so.
 data Lease = (
   io: IO,
   config: Config,
@@ -87,17 +87,17 @@ data Lease = (
   parameters: Hash[String, String],
   statements: StatementCache::Snapshot,
   # The notifications received and not yet taken, and the channels
-  # listened to (`PG::Connection#listen`).
+  # listened to ([PG::Connection#listen]).
   notifications: Array[Notification],
   channels: Set[String],
-  # Whether a LISTEN may be in force that `channels` does not show.
+  # Whether a LISTEN may be in force that [channels] does not show.
   unsure: Bool
 )
 
 # A session with the server: one task's at a time. Moving it to another
-# task goes through a `PG::Lease`.
+# task goes through a [PG::Lease].
 class Connection
-  # How many prepared statements `#query` keeps by default.
+  # How many prepared statements [#query] keeps by default.
   STATEMENT_CACHE_SIZE = 100
 
   @config: Config
@@ -119,7 +119,7 @@ class Connection
   var @channels: Set[String] = Set[String].new
   var @unsure: Bool = false
 
-  # Connects with `config` and authenticates (see `PG.connect`).
+  # Connects with `config` and authenticates (see [PG.connect]).
   def self.open(config: Config) -> Connection
     if (limit = config.connect_timeout)
       begin
@@ -264,13 +264,13 @@ class Connection
     "md5" + Digest::MD5.hexdigest(Digest::MD5.hexdigest(password + user).to_bytes + salt)
   end
 
-  # A connection over `io`, not started: `PG.connect` makes them.
+  # A connection over `io`, not started: [PG.connect] makes them.
   def initialize(@config: Config, @io: IO)
     @reader = MessageReader.new(io)
     @statements = StatementCache.new(@config.statement_cache_size)
   end
 
-  # The connection `lease` describes (see `.adopt`).
+  # The connection `lease` describes (see [.adopt]).
   def initialize(lease: Lease)
     @config = lease.config
     @io = lease.io
@@ -285,11 +285,11 @@ class Connection
   end
 
   # Makes a connection of `lease` in the calling task: the session goes on
-  # where `#release` left it (idle, its prepared statements kept). A lease
+  # where [#release] left it (idle, its prepared statements kept). A lease
   # is used once.
   def self.adopt(lease: Lease) -> Connection = Connection.new(lease)
 
-  # Gives the session up as a `PG::Lease`, for another task to `.adopt`;
+  # Gives the session up as a [PG::Lease], for another task to [.adopt];
   # this object is closed for use afterwards (its socket stays open). Only
   # an idle session is given up: one in a transaction is rolled back
   # first. Returns nil, closing the socket, when the session cannot go on:
@@ -317,7 +317,7 @@ class Connection
   # kept up to date.
   def parameters -> Hash[String, String] = @parameters
 
-  # The server's version, as `server_version` reports it (`"17.11 (Debian
+  # The server's version, as [server_version] reports it (`"17.11 (Debian
   # 17.11-0+deb13u1)"`).
   def server_version -> String = @parameters["server_version"]? || ""
 
@@ -336,21 +336,21 @@ class Connection
 
   # Listens to `channel` (LISTEN, the name quoted as an identifier, so
   # that any name of 1 to 63 bytes works, case kept): the server then
-  # sends this session every NOTIFY on it, which `#wait_for_notify` and
-  # `#notifications` give. Listening again to a channel does nothing. A
+  # sends this session every NOTIFY on it, which [#wait_for_notify] and
+  # [#notifications] give. Listening again to a channel does nothing. A
   # LISTEN takes effect when its transaction commits (at once outside
-  # one). Raises `ArgumentError` for an empty name, one holding a NUL, or
+  # one). Raises [ArgumentError] for an empty name, one holding a NUL, or
   # one of 64 bytes or more (the server would cut it to 63).
   #
   # Listen through this method rather than `exec("LISTEN ...")`: only it
-  # is tracked (`#listening?`), which `PG::Pool` relies on.
+  # is tracked ([#listening?]), which [PG::Pool] relies on.
   def listen(channel: String) -> Void
     exec("LISTEN #{Connection.quote_ident(channel)}")
     @channels = @channels.add(channel)
   end
 
   # Stops listening to `channel` (UNLISTEN). Notifications already
-  # received stay queued. Raises `ArgumentError` for a name `#listen`
+  # received stay queued. Raises [ArgumentError] for a name [#listen]
   # refuses.
   def unlisten(channel: String) -> Void
     exec("UNLISTEN #{Connection.quote_ident(channel)}")
@@ -366,17 +366,17 @@ class Connection
     @unsure = @status != "I"
   end
 
-  # Whether a LISTEN through `#listen` may be in force on this session: a
-  # channel listened to and not unlistened, or an `#unlisten` in a
-  # transaction (a rollback would undo it). A LISTEN sent with `#exec`
+  # Whether a LISTEN through [#listen] may be in force on this session: a
+  # channel listened to and not unlistened, or an [#unlisten] in a
+  # transaction (a rollback would undo it). A LISTEN sent with [#exec]
   # is not seen.
   def listening? -> Bool = !@channels.empty? || @unsure
 
   # Sends a notification on `channel` with `payload` (`pg_notify`, as a
   # query with parameters: no quoting). Inside a transaction it is
   # delivered when the transaction commits, and not at all if it rolls
-  # back. Raises `ArgumentError` for a channel name `#listen` refuses,
-  # and `PG::ServerError` for what the server refuses (a payload of 8000
+  # back. Raises [ArgumentError] for a channel name [#listen] refuses,
+  # and [PG::ServerError] for what the server refuses (a payload of 8000
   # bytes or more).
   def notify(channel: String, payload: String = "") -> Void
     ::check_channel(channel)
@@ -386,7 +386,7 @@ class Connection
 
   # The notifications received so far and not yet taken, oldest first,
   # taking them: those that arrived while the connection ran queries, or
-  # read by `#wait_for_notify` along with others. Does not read the
+  # read by [#wait_for_notify] along with others. Does not read the
   # socket.
   def notifications -> Array[Notification]
     all = @notifications
@@ -394,17 +394,17 @@ class Connection
     all
   end
 
-  # The next notification: a queued one (see `#notifications`), else one
+  # The next notification: a queued one (see [#notifications]), else one
   # read from the socket, waiting up to `timeout` (`nil`: without limit).
   # Returns nil when `timeout` passes first. Only the calling task waits;
-  # `Task.timeout` and `cancel` interrupt the wait. An interrupted wait
+  # [Task.timeout] and `cancel` interrupt the wait. An interrupted wait
   # leaves the connection usable when it was waiting between messages, as
   # it nearly always is; one interrupted in the middle of a message (the
-  # rest of it not arrived yet) closes the connection, as `#exec` says.
+  # rest of it not arrived yet) closes the connection, as [#exec] says.
   # The server delivers notifications only between transactions: inside
-  # one (`#transaction`), this waits for its timeout.
-  # Raises `PG::ConnectionError` when the connection is closed or breaks,
-  # `PG::ServerError` when the server ends the session (an administrator's
+  # one ([#transaction]), this waits for its timeout.
+  # Raises [PG::ConnectionError] when the connection is closed or breaks,
+  # [PG::ServerError] when the server ends the session (an administrator's
   # `pg_terminate_backend`, a shutdown).
   def wait_for_notify(timeout: Duration? = nil) -> Notification?
     if (n = @notifications.first?)
@@ -455,7 +455,7 @@ class Connection
   end
 
   # `name` as an SQL identifier: double-quoted, a `"` in it doubled.
-  # Raises `ArgumentError` for an empty name, one holding a NUL, or one of
+  # Raises [ArgumentError] for an empty name, one holding a NUL, or one of
   # 64 bytes or more (the server cuts an identifier to 63 bytes).
   #
   # ```
@@ -468,16 +468,16 @@ class Connection
   end
 
   # Calls the block with each notice or warning the server sends (its
-  # fields, as `PG::ServerError#fields`); without a handler they are dropped.
+  # fields, as [PG::ServerError#fields]); without a handler they are dropped.
   def on_notice(&handler: (Hash[String, String]) -> Void) -> Void
     @notice_handler = handler
   end
 
   # Runs `sql` (one statement or several, separated by `;`) with the
   # simple protocol, and returns the last statement's result. Raises
-  # `PG::ServerError` for the first statement that fails, after which the
+  # [PG::ServerError] for the first statement that fails, after which the
   # statements after it do not run (and, outside a transaction block, the
-  # ones before it stay done). Takes no parameters: use `#query` for
+  # ones before it stay done). Takes no parameters: use [#query] for
   # values.
   #
   # A call that does not read the server's whole answer (its task was
@@ -486,7 +486,7 @@ class Connection
   # one's.
   def exec(sql: String) -> Result = exec_all(sql).last? || Result.new([], [], "")
 
-  # As `#exec`, but returns every statement's result, in order.
+  # As [#exec], but returns every statement's result, in order.
   def exec_all(sql: String) -> Array[Result]
     results: Array[Result] = []
     columns: Array[Field] = []
@@ -518,8 +518,8 @@ class Connection
   # quoting. A parameter may be nil (NULL), an Int, a Float, a String, a
   # Bool, Bytes (bytea), a Time (sent in UTC), a Date (its ISO text), a
   # Decimal (its text) or a Symbol (its name);
-  # another raises `ArgumentError`. Raises `PG::ServerError` when the
-  # statement fails. A call cut short closes the connection, as `#exec`
+  # another raises [ArgumentError]. Raises [PG::ServerError] when the
+  # statement fails. A call cut short closes the connection, as [#exec]
   # says.
   #
   # The statement is prepared once and kept, by its SQL text, among the
@@ -600,9 +600,9 @@ class Connection
   # returns, or ROLLBACK when it raises (the exception goes on) or leaves
   # otherwise (`return`, `break`). When a statement in the block failed
   # and the block went on after rescuing it, the server rolls the
-  # transaction back at COMMIT; this raises `PG::ServerError` (SQLSTATE 25P02)
+  # transaction back at COMMIT; this raises [PG::ServerError] (SQLSTATE 25P02)
   # then, rather than returning as if it had been committed. Returns the
-  # block's value. Raises `PG::TransactionError` when the connection is in
+  # block's value. Raises [PG::TransactionError] when the connection is in
   # a transaction already: there are no nested transactions (no
   # savepoints) yet.
   def transaction[R](&: (Connection) -> R) -> R
@@ -632,8 +632,8 @@ class Connection
 
   # A parameter's text, as the server reads it (nil for NULL). A Time is
   # sent in UTC, so that a `timestamp` column (without zone), which drops
-  # the offset, keeps the instant as `PG::Row#time` reads it back. An
-  # `Array` is a one-dimensional PostgreSQL array (`encode_array`).
+  # the offset, keeps the instant as [PG::Row#time] reads it back. An
+  # [Array] is a one-dimensional PostgreSQL array (`encode_array`).
   #
   # ```
   # PG::Connection.encode(true)                # => b"t"
@@ -676,7 +676,7 @@ class Connection
   # An array parameter's text: `{1,2,3}`, each element as `encode` gives
   # it, double-quoted when it is empty, spells NULL or holds `,`, `{`,
   # `}`, `"`, `\` or white space (`"` and `\` escaped with `\`); a nil
-  # element is NULL, the empty array `{}`. Raises `ArgumentError` for
+  # element is NULL, the empty array `{}`. Raises [ArgumentError] for
   # elements of different classes or a nested array (one dimension for
   # now).
   #
@@ -707,7 +707,7 @@ class Connection
   end
 
   # The class of an array parameter's elements, nil when it has none but
-  # nils; `ArgumentError` for mixed classes or a nested array.
+  # nils; [ArgumentError] for mixed classes or a nested array.
   def self.element_class(xs: Array[Object?]) -> Type[Object]?
     first: Type[Object]? = nil
     at = 0
@@ -828,10 +828,10 @@ class Connection
   rescue Exception
   end
 
-  # Whether `#close` was called, or the connection broke.
+  # Whether [#close] was called, or the connection broke.
   def closed? -> Bool = @closed
 
-  # Whether the session goes over TLS (see `sslmode` in `PG.connect`).
+  # Whether the session goes over TLS (see `sslmode` in [PG.connect]).
   def tls? -> Bool = @io.is_a?(TLSSocket)
 
   # Ends the session: tells the server, and closes the socket. Closing a
@@ -848,7 +848,7 @@ class Connection
   end
 
   # The startup exchange: authentication, then the session's parameters,
-  # up to the first ReadyForQuery. Called by `PG.connect`.
+  # up to the first ReadyForQuery. Called by [PG.connect].
   def startup -> Void
     # The readers of `PG::Row` read ISO dates and floats in full.
     params = { "user" => @config.user, "client_encoding" => "UTF8", "DateStyle" => "ISO",

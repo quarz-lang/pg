@@ -14,7 +14,7 @@
 # end
 # ```
 #
-# In a `Test::Case`, start one for the class and omit its tests when
+# In a [Test::Case], start one for the class and omit its tests when
 # there is none:
 #
 # ```quarz no_run
@@ -55,7 +55,7 @@ module Testing
     @dir: String?
     @bin: String
 
-    # (Made by `PG::Testing.start`.)
+    # (Made by [PG::Testing.start].)
     def initialize(@url: String, @dir: String?, @bin: String); end
 
     # A URL to connect to it, with its password.
@@ -88,8 +88,8 @@ module Testing
   # superuser is `quarz` and whose `pg_hba.conf` starts with the lines
   # `hba` gives (`"host all md5_user 127.0.0.1/32 md5"`), before
   # SCRAM-SHA-256 for every connection (`hba` does nothing to
-  # PG_TEST_URL's server: check `Server#ours?` before relying on it).
-  # Raises `Unavailable` when there is neither.
+  # PG_TEST_URL's server: check [Server#ours?] before relying on it).
+  # Raises [Unavailable] when there is neither.
   #
   # Given a `certificate` (PEM, the server's own first) and its
   # `private_key` (PEM), it is always a new cluster, with TLS on (`ssl =

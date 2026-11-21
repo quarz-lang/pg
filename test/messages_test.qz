@@ -10,6 +10,8 @@ class FrontendTest < Test::Case
   def test_password
     assert_equal(b"p\x00\x00\x00\x05\x00", PG::Frontend.password(""))
     assert_equal(b"p\x00\x00\x00\x08abc\x00", PG::Frontend.password("abc"))
+    assert_equal(b"p\x00\x00\x00\x08abc\x00", PG::Frontend.password(Bytes::Secret.of(b"abc")))
+    assert_raise(ArgumentError) { PG::Frontend.password(Bytes::Secret.of(b"a\x00b")) }
   end
 
   def test_sasl

@@ -28,6 +28,9 @@ Work in progress. What exists:
   `options` (keyword or URL parameter, as libpq's) sends server
   settings for the session at startup:
   `?options=-c%20search_path%3Dapp` or `options: "-c statement_timeout=5s"`.
+  `password:` also takes a `Bytes::Secret`, used with no `String` of it
+  made (the cleartext and md5 messages, and md5's digest input, are
+  still plain `Bytes`; SCRAM's salted password is a secret).
   The settings pg sends itself (`DateStyle`, `client_encoding`,
   `extra_float_digits`, `application_name`) keep pg's values: the server
   takes the startup message's own parameters over `options`.

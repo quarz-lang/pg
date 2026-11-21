@@ -33,12 +33,23 @@ module Frontend
   end
 
   # A password, in clear or as md5 auth hashes it (the protocol's PasswordMessage).
+  # A [Bytes::Secret] makes no [String], but the message is a plain
+  # [Bytes] holding it, which nothing clears.
   #
   # ```
   # PG::Frontend.password("pw")   # => b"p\x00\x00\x00\x07pw\x00"
+  # PG::Frontend.password(Bytes::Secret.of(b"pw"))   # => b"p\x00\x00\x00\x07pw\x00"
   # ```
-  def self.password(text: String) -> Bytes
-    Wire.frame('p'.ord, Wire.cstring(Bytes::Builder.new, text).to_bytes)
+  def self.password(text: String | Bytes::Secret) -> Bytes
+    case text
+    in String
+      Wire.frame('p'.ord, Wire.cstring(Bytes::Builder.new, text).to_bytes)
+    in Bytes::Secret
+      bytes = text.expose_bytes
+      # (Not quoted: it is a password.)
+      raise ArgumentError.new("a password with a NUL in a message to the server") if bytes.include?(b"\0")
+      Wire.frame('p'.ord, (Bytes::Builder.new << bytes << 0).to_bytes)
+    end
   end
 
   # The first SASL message: the mechanism chosen and its first data (nil:

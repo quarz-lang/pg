@@ -7,7 +7,8 @@
 # s.client_first   # => "n,,n=user,r=rOprNGfwEbeRWgbNEkqO"
 # ```
 #
-# The password is used as it is: SASLprep, which PostgreSQL applies when
+# The password is used as it is (a [Bytes::Secret] too, with no [String]
+# of it made; the salted password is one): SASLprep, which PostgreSQL applies when
 # the password is valid for it, changes only passwords with characters
 # beyond ASCII that it maps or forbids, so such a password may be refused.
 class Scram
@@ -25,7 +26,7 @@ class Scram
   # ([Task.blocking]), so that the worker's other tasks go on meanwhile.
   BLOCKING_ITERATIONS = 10_000
 
-  @password: String
+  @password: String | Bytes::Secret
   @nonce: String
   @user: String
   @max_iterations: Int
@@ -35,7 +36,7 @@ class Scram
 
   # A new exchange for `password`, with a random 18-byte nonce unless one
   # is given (tests).
-  def initialize(@password: String, nonce: String? = nil, user: String = "",
+  def initialize(@password: String | Bytes::Secret, nonce: String? = nil, user: String = "",
                  max_iterations: Int = MAX_ITERATIONS)
     @max_iterations = max_iterations
     @nonce = nonce || Base64.encode(Random.bytes(18))
@@ -90,14 +91,14 @@ class Scram
   # server has not proved that it knows the password.
   def verified? -> Bool = @verified
 
-  # PBKDF2-HMAC-SHA-256 of the password: on a helper thread when the
-  # count is large (`password` and `salt` are immutable, so the block may
-  # take them there).
-  def self.salted_password(password: String, salt: Bytes, rounds: Int) -> Bytes
+  # PBKDF2-HMAC-SHA-256 of the password, as a [Bytes::Secret]: on a
+  # helper thread when the count is large (`password` and `salt` are
+  # immutable or shareable, so the block may take them there).
+  def self.salted_password(password: String | Bytes::Secret, salt: Bytes, rounds: Int) -> Bytes::Secret
     if rounds > BLOCKING_ITERATIONS
-      Task.blocking { Digest::PBKDF2.sha256(password, salt, rounds, 32) }
+      Task.blocking { Digest::PBKDF2.sha256_secret(password, salt, rounds, 32) }
     else
-      Digest::PBKDF2.sha256(password, salt, rounds, 32)
+      Digest::PBKDF2.sha256_secret(password, salt, rounds, 32)
     end
   end
 

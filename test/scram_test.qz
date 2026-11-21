@@ -17,6 +17,13 @@ class ScramTest < Test::Case
     assert_true(s.verified?)
   end
 
+  # A Bytes::Secret password: the same exchange.
+  def test_rfc7677_exchange_with_a_secret
+    s = PG::Scram.new(Bytes::Secret.of(b"pencil"), nonce: "rOprNGfwEbeRWgbNEkqO", user: "user")
+    assert_equal(CLIENT_FINAL, s.client_final(SERVER_FIRST))
+    assert_nothing_raised { s.verify(SERVER_FINAL) }
+  end
+
   def test_postgres_form
     s = PG::Scram.new("pw")
     assert_match(/\An,,n=,r=[A-Za-z0-9+\/]{24}\z/, s.client_first)
@@ -53,7 +60,9 @@ class ScramTest < Test::Case
   # Above BLOCKING_ITERATIONS the hashing runs on a helper thread: the same
   # bytes.
   def test_salted_password_on_a_helper_thread
-    assert_equal(Digest::PBKDF2.sha256("pw", b"salt", 20_000, 32), PG::Scram.salted_password("pw", b"salt", 20_000))
+    assert_equal(Digest::PBKDF2.sha256_secret("pw", b"salt", 20_000, 32), PG::Scram.salted_password("pw", b"salt", 20_000))
+    assert_equal(Digest::PBKDF2.sha256_secret("pw", b"salt", 20_000, 32),
+                 PG::Scram.salted_password(Bytes::Secret.of(b"pw"), b"salt", 20_000))
   end
 
   def test_verify_before_final

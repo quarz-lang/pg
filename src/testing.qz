@@ -69,7 +69,11 @@ module Testing
     def socket_dir -> String? = @dir
 
     # The password in the URL.
-    def password -> String = cog.parse_url(@url).password || ""
+    def password -> String
+      # (A URL's password is a String.)
+      p = cog.parse_url(@url).password
+      p.is_a?(String) ? p : ""
+    end
 
     # The port in the URL.
     def port -> Int = cog.parse_url(@url).port

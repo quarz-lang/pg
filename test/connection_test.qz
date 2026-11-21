@@ -89,6 +89,15 @@ class ConnectionTest < Test::Case
     end
   end
 
+  # The same server, its password given as a Bytes::Secret.
+  def test_secret_password
+    config = PG.parse_url(server.url)
+    c = PG.connect(host: config.host, port: config.port, user: config.user,
+                   password: Bytes::Secret.of(server.password.to_bytes), database: config.database)
+    assert_false(c.server_version.empty?)
+    c.close
+  end
+
   def test_missing_database
     config = PG.parse_url(server.url)
     e = assert_raise(PG::ServerError) do
@@ -181,6 +190,43 @@ class ConnectionFailureTest < Test::Case
     server.close
   end
 
+  # The password message a client sends to a server that asks with
+  # `request` (an Authentication message's body), the connection given
+  # `password`.
+  def password_sent(request: Bytes, password: String | Bytes::Secret) -> Bytes
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.local_address.port
+    sent = Task.scope do |scope|
+      got = scope.spawn do
+        peer = server.accept
+        size = peer.read_bytes(4)
+        peer.read_bytes(((size[0] << 24) | (size[1] << 16) | (size[2] << 8) | size[3]) - 4)
+        peer.write(PG::Wire.frame('R'.ord, request))
+        head = peer.read_bytes(5)
+        body = peer.read_bytes(((head[1] << 24) | (head[2] << 16) | (head[3] << 8) | head[4]) - 4)
+        peer.close
+        head + body
+      end
+      assert_raise(PG::ConnectionError) do
+        PG.connect(host: "127.0.0.1", port: port, user: "ann", password: password, sslmode: :disable,
+                   allow_cleartext: true)
+      end
+      got.await
+    end
+    server.close
+    sent
+  end
+
+  # A Bytes::Secret password sends what its String sends.
+  def test_secret_password_in_clear_and_md5
+    clear = b"\x00\x00\x00\x03"
+    md5 = b"\x00\x00\x00\x05\x01\x02\x03\x04"
+    secret = Bytes::Secret.of(b"secret")
+    assert_equal(PG::Frontend.password("secret"), password_sent(clear, secret))
+    assert_equal(password_sent(md5, "secret"), password_sent(md5, secret))
+    assert_equal(PG::Frontend.password("md59009ce60b9ca97f1e752376843d1309e"), password_sent(md5, secret))
+  end
+
   def test_max_scram_iterations_in_url
     assert_equal(1_000_000, PG.parse_url("postgres://h/d").max_scram_iterations)
     assert_equal(5_000_000, PG.parse_url("postgres://h/d?max_scram_iterations=5000000").max_scram_iterations)
@@ -245,7 +291,10 @@ class ConnectionFailureTest < Test::Case
       assert_true(text.include?("[FILTERED]"))
     end
     assert_true(PG.parse_url("postgres://u@h/d").inspect.include?("password: nil"))
-    assert_equal("SECRETPW", c.with(port: 1).password)
+    assert_equal("SECRETPW", c.with(port: 1).password.as?(String))
+    shown = c.with(password: Bytes::Secret.of(b"SECRETPW")).inspect
+    assert_true(shown.include?("password: \"[FILTERED]\""), shown)
+    assert_false(shown.include?("Bytes::Secret"), shown)
   end
 
   def test_a_nul_in_a_credential_is_not_quoted
@@ -254,11 +303,13 @@ class ConnectionFailureTest < Test::Case
   end
 
   def test_an_empty_password_is_not_a_refusal
-    assert_equal("", PG.parse_url("postgres://u:@h/d").password)
+    assert_equal("", PG.parse_url("postgres://u:@h/d").password.as?(String))
   end
 
   def test_md5_password
     # md5(md5(password + user) + salt), computed with Python's hashlib.
     assert_equal("md59009ce60b9ca97f1e752376843d1309e", PG::Connection.md5_password("ann", "secret", b"\x01\x02\x03\x04"))
+    assert_equal("md59009ce60b9ca97f1e752376843d1309e",
+                 PG::Connection.md5_password("ann", Bytes::Secret.of(b"secret"), b"\x01\x02\x03\x04"))
   end
 end

@@ -5,7 +5,9 @@ data Config(
   host: String,
   port: Int,
   user: String,
-  password: String?,
+  # A [Bytes::Secret] is used as it is: no [String] of it is made (its
+  # limits: [PG::Frontend.password], [PG::Connection.md5_password]).
+  password: (String | Bytes::Secret)?,
   # nil: the user's name, as the server takes it.
   database: String?,
   application_name: String?,

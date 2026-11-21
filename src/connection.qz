@@ -43,7 +43,7 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 # never uses TLS, whatever `sslmode` says. A TLS failure (a certificate
 # refused, a handshake that fails) is a [PG::ConnectionError] saying why.
 public def connect(*, host: String = "localhost", port: Int = 5432, user: String = Config.default_user,
-                   password: String? = nil, database: String? = nil, application_name: String? = nil,
+                   password: (String | Bytes::Secret)? = nil, database: String? = nil, application_name: String? = nil,
                    allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
                    max_scram_iterations: Int = Scram::MAX_ITERATIONS,
                    statement_cache_size: Int = Connection::STATEMENT_CACHE_SIZE,
@@ -259,9 +259,16 @@ class Connection
   end
 
   # What `md5` authentication sends: `md5` and the hex digest of the hex
-  # digest of `password` and `user`, then `salt`.
-  def self.md5_password(user: String, password: String, salt: Bytes) -> String
-    "md5" + Digest::MD5.hexdigest(Digest::MD5.hexdigest(password + user).to_bytes + salt)
+  # digest of `password` and `user`, then `salt`. A [Bytes::Secret]
+  # password makes no [String], but MD5 takes no secret: its bytes and
+  # the user's are joined in a plain [Bytes] for the digest, which
+  # nothing clears.
+  def self.md5_password(user: String, password: String | Bytes::Secret, salt: Bytes) -> String
+    inner = case password
+            in String then Digest::MD5.hexdigest(password + user)
+            in Bytes::Secret then Digest::MD5.hexdigest((Bytes::Builder.new << password.expose_bytes << user).to_bytes)
+            end
+    "md5" + Digest::MD5.hexdigest(inner.to_bytes + salt)
   end
 
   # A connection over `io`, not started: [PG.connect] makes them.
@@ -944,7 +951,7 @@ class Connection
     raise AuthenticationError.new("the server changed the authentication method during SCRAM") if scram
   end
 
-  private def password -> String
+  private def password -> String | Bytes::Secret
     @config.password || raise(AuthenticationError.new("the server asks for a password, and none was given"))
   end
 

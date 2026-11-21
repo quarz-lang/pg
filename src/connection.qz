@@ -79,7 +79,7 @@ data Notification = (channel: String, payload: String, process_id: Int)
 # session's state, so that it can move to another task, which makes a
 # [PG::Connection] of it again ([PG::Connection#release],
 # [PG::Connection.adopt]). [PG::Pool] keeps its idle connections so.
-data Lease = (
+data Lease(
   io: IO,
   config: Config,
   process_id: Int,
@@ -93,6 +93,13 @@ data Lease = (
   # Whether a LISTEN may be in force that [channels] does not show.
   unsure: Bool
 )
+  # The lease without its cancel key (`secret`) and its configuration's
+  # password ([PG::Config#inspect]).
+  def inspect -> String = "#<PG::Lease process_id: #{process_id}, config: #{config.inspect}>"
+
+  # :ditto:
+  def to_s -> String = inspect
+end
 
 # A session with the server: one task's at a time. Moving it to another
 # task goes through a [PG::Lease].
@@ -118,6 +125,12 @@ class Connection
   # rollback undoes).
   var @channels: Set[String] = Set[String].new
   var @unsure: Bool = false
+
+  # The connection without its cancel key and its configuration's
+  # password ([PG::Config#inspect]).
+  def inspect -> String
+    "#<PG::Connection process_id: #{@process_id}, closed: #{@closed}, config: #{@config.inspect}>"
+  end
 
   # Connects with `config` and authenticates (see [PG.connect]).
   def self.open(config: Config) -> Connection

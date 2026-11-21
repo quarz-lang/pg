@@ -98,6 +98,33 @@ class ConnectionTest < Test::Case
     c.close
   end
 
+  # pg#44: a connection, its lease, an idle pool and SCRAM show no
+  # password and no cancel key.
+  def test_inspect_shows_no_secret
+    config = PG.parse_url(server.url)
+    password = server.password
+    c = PG.connect(server.url)
+    shown = [c.inspect, c.to_s]
+    lease = c.release || flunk("no lease")
+    secret = lease.secret.to_a.map(&:to_s).join(", ")
+    shown = shown.push(lease.inspect).push(lease.to_s).push([lease].inspect)
+    c = PG::Connection.adopt(lease)
+    c.close
+    pool = PG::Pool.new(config)
+    pool.with { |k| k.query("SELECT 1", []) }
+    shown = shown.push(pool.inspect)
+    pool.close
+    s = PG::Scram.new(password, nonce: "n", user: "u")
+    shown = shown.push(s.inspect).push(s.to_s)
+    shown.each do |text|
+      assert_false(text.include?(password), text)
+      assert_false(text.include?(secret), text)
+      assert_false(text.include?(lease.secret.inspect), text)
+    end
+    assert_match(/\A#<PG::Lease process_id: \d+, config: #<PG::Config /, lease.inspect)
+    assert_equal("#<PG::Scram verified: false>", s.inspect)
+  end
+
   def test_missing_database
     config = PG.parse_url(server.url)
     e = assert_raise(PG::ServerError) do

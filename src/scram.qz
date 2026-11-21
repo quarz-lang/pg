@@ -43,6 +43,9 @@ class Scram
     @user = user.gsub("=", "=3D").gsub(",", "=2C")
   end
 
+  # The exchange without its password and the keys derived from it.
+  def inspect -> String = "#<PG::Scram verified: #{@verified}>"
+
   # The first message: the GS2 header and the bare part.
   def client_first -> String = "n,,#{first_bare}"
 

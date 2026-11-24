@@ -83,6 +83,19 @@ class BackendTest < Test::Case
     assert_raise(PG::ProtocolError) { decode("Z", b"X") }
     assert_equal[PG::Backend](PG::Backend::NegotiateProtocolVersion.new(0, ["_pq_.x"]),
                               decode("v", b"\x00\x00\x00\x00\x00\x00\x00\x01_pq_.x\x00"))
+    assert_equal[PG::Backend](PG::Backend::NegotiateProtocolVersion.new(2, []), decode("v", b"\x00\x00\x00\x02\x00\x00\x00\x00"))
+  end
+
+  # #48: the option count of a NegotiateProtocolVersion is checked against
+  # the bytes the message holds before anything is made for it: a count
+  # near 2^31 in a 12-byte message is refused, not reserved.
+  def test_negotiate_protocol_version_count_is_bounded
+    e = assert_raise(PG::ProtocolError) { decode("v", b"\x00\x00\x00\x00\x7f\xff\xff\xff\x00\x00\x00\x00") }
+    assert_equal("a NegotiateProtocolVersion message counts 2147483647 options in 4 bytes", e.message)
+    e = assert_raise(PG::ProtocolError) { decode("v", b"\x00\x00\x00\x00\xff\xff\xff\xff") }
+    assert_equal("a NegotiateProtocolVersion message counts -1 options in 0 bytes", e.message)
+    # Two options counted, one there: the message runs out.
+    assert_raise(PG::ProtocolError) { decode("v", b"\x00\x00\x00\x00\x00\x00\x00\x02a\x00") }
   end
 
   def test_rows

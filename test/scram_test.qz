@@ -30,6 +30,16 @@ class ScramTest < Test::Case
     assert_false(s.client_first == PG::Scram.new("pw").client_first)
   end
 
+  # #50: the nonce does not come from Random: the same seed twice gives
+  # two different nonces.
+  def test_nonce_not_from_random
+    srand(7)
+    a = PG::Scram.new("pw").client_first
+    srand(7)
+    b = PG::Scram.new("pw").client_first
+    assert_false(a == b)
+  end
+
   def test_user_name_escaped
     assert_equal("n,,n=a=2Cb=3D,r=x", PG::Scram.new("p", nonce: "x", user: "a,b=").client_first)
   end

@@ -35,11 +35,14 @@ class Scram
   var @verified: Bool = false
 
   # A new exchange for `password`, with a random 18-byte nonce unless one
-  # is given (tests).
+  # is given (tests). The nonce comes from the operating system's
+  # cryptographic source ([Crypto.random_bytes]), not from [Random], which
+  # `srand` repeats and whose output on the wire would give its state away
+  # (#50).
   def initialize(@password: String | Bytes::Secret, nonce: String? = nil, user: String = "",
                  max_iterations: Int = MAX_ITERATIONS)
     @max_iterations = max_iterations
-    @nonce = nonce || Base64.encode(Random.bytes(18))
+    @nonce = nonce || Base64.encode(Crypto.random_bytes(18))
     @user = user.gsub("=", "=3D").gsub(",", "=2C")
   end
 

@@ -42,12 +42,27 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 # `root.crt` makes `:require` fail. A unix socket (`host` starting with `/`)
 # never uses TLS, whatever `sslmode` says. A TLS failure (a certificate
 # refused, a handshake that fails) is a [PG::ConnectionError] saying why.
+#
+# `require_auth` lists the authentication methods the server may ask for,
+# as libpq's (`"scram-sha-256"`, `"md5,scram-sha-256"`, `"!password"`,
+# [PG::Config.require_auth]); a method it does not list is a
+# [PG::AuthenticationError] before anything is sent, and `none` allows a
+# server that asks for no authentication. Without it, SCRAM-SHA-256 is
+# allowed always, and md5 and no authentication only when the server is
+# authenticated otherwise: over a unix socket, or over TLS verified
+# against roots (`:verify_ca`, `:verify_full`, or roots with the other
+# modes). Anyone answering as the server can otherwise ask for md5 (and
+# get a value to guess the password from) or for none (and get the
+# queries). A server still on md5 (`password_encryption = md5`) or
+# `trust` over plain TCP needs `require_auth: "md5"` or `"none"` (pg#49).
+# A password in clear also needs `allow_cleartext` over TCP.
 public def connect(*, host: String = "localhost", port: Int = 5432, user: String = Config.default_user,
                    password: (String | Bytes::Secret)? = nil, database: String? = nil, application_name: String? = nil,
                    allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
                    max_scram_iterations: Int = Scram::MAX_ITERATIONS,
                    statement_cache_size: Int = Connection::STATEMENT_CACHE_SIZE,
-                   sslmode: Symbol? = nil, sslrootcert: String? = nil, options: String? = nil) -> Connection
+                   sslmode: Symbol? = nil, sslrootcert: String? = nil, options: String? = nil,
+                   require_auth: String? = nil) -> Connection
   if statement_cache_size < 0 || statement_cache_size > 999_999
     raise ArgumentError.new("statement_cache_size: #{statement_cache_size}")
   end
@@ -58,7 +73,7 @@ public def connect(*, host: String = "localhost", port: Int = 5432, user: String
   Connection.open(Config.new(host:, port:, user:, password:, database:, application_name:,
                              allow_cleartext:, connect_timeout:, max_scram_iterations:,
                              statement_cache_size:, sslmode: Config.sslmode(sslmode, sslrootcert),
-                             sslrootcert:, options:))
+                             sslrootcert:, options:, require_auth: (t = require_auth) ? Config.require_auth(t) : nil))
 end
 
 # Raises `ArgumentError` for a channel name the server cannot take as
@@ -906,17 +921,49 @@ class Connection
     end
   end
 
+  # Whether the server is authenticated by the connection itself: a unix
+  # socket, or TLS verified against roots. Only then may it ask for md5 or
+  # for no authentication without `require_auth` (pg#49).
+  private def server_authenticated? -> Bool
+    return true if @config.host.start_with?("/")
+    tls = @io.as?(TLSSocket)
+    !tls.nil? && tls.verified?
+  end
+
+  # Refuses the method `method` the server asked for when `require_auth`
+  # does not list it or, without `require_auth`, when the server is not
+  # authenticated and the method would give it something (an md5 value
+  # to guess the password from, or the session without any check).
+  private def allow_method(method: Symbol) -> Void
+    shown = {password: "a password in clear", md5: "md5 password authentication",
+             scram_sha_256: "SCRAM-SHA-256", none: "no authentication"}[method]? || method.to_s
+    if (allowed = @config.require_auth)
+      return if allowed.include?(method)
+      raise AuthenticationError.new("the server asked for #{shown}, which require_auth does not allow")
+    end
+    return unless method == :md5 || method == :none
+    return if server_authenticated?
+    name = method == :md5 ? "md5" : "none"
+    raise AuthenticationError.new("the server asked for #{shown} over a connection that does not authenticate it " +
+                                  "(a unix socket, or TLS verified against roots); pass require_auth: \"#{name}\" to allow it")
+  end
+
   private def authenticate -> Void
     scram: Scram? = nil
+    # Whether the server asked for any method before AuthenticationOk.
+    asked = false
     loop do
       case m = receive
       in Backend::AuthenticationOk
         if (s = scram) && !s.verified?
           raise AuthenticationError.new("the server ended SCRAM without proving that it knows the password")
         end
+        allow_method(:none) unless asked
         break
       in Backend::AuthenticationCleartextPassword
         refuse_after_sasl(scram)
+        asked = true
+        allow_method(:password)
         unless @config.host.start_with?("/") || @config.allow_cleartext
           raise AuthenticationError.new("the server asks for the password in clear over TCP; " +
                                         "pass allow_cleartext: true to send it so")
@@ -924,6 +971,8 @@ class Connection
         send(Frontend.password(password))
       in Backend::AuthenticationMD5Password(salt:)
         refuse_after_sasl(scram)
+        asked = true
+        allow_method(:md5)
         send(Frontend.password(Connection.md5_password(@config.user, password, salt)))
       in Backend::AuthenticationSASL(mechanisms:)
         unless mechanisms.include?(Scram::MECHANISM)
@@ -931,6 +980,8 @@ class Connection
                                         "and this client speaks #{Scram::MECHANISM} only")
         end
         refuse_after_sasl(scram)
+        asked = true
+        allow_method(:scram_sha_256)
         s = Scram.new(password, max_iterations: @config.max_scram_iterations)
         scram = s
         send(Frontend.sasl_initial_response(Scram::MECHANISM, s.client_first.to_bytes))

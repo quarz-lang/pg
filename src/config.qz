@@ -35,7 +35,14 @@ data Config(
   # none). A setting pg sends itself (DateStyle, client_encoding,
   # extra_float_digits, application_name) keeps pg's value: the server
   # takes the startup message's own parameters over these.
-  options: String? = nil
+  options: String? = nil,
+  # The authentication methods the server may ask for, as libpq's
+  # `require_auth` ([Config.require_auth] reads its text): `:password`
+  # (in clear), `:md5`, `:scram_sha_256`, `:none` (no authentication),
+  # `:gss`, `:sspi`. nil: SCRAM-SHA-256 always, and md5 and no
+  # authentication only when the server is authenticated otherwise (a
+  # unix socket, or TLS verified against roots) (pg#49).
+  require_auth: Array[Symbol]? = nil
 )
   # The configuration as text, the password left out (a configuration is
   # logged, interpolated and printed).
@@ -43,10 +50,38 @@ data Config(
     shown = password.nil? ? "nil" : "\"[FILTERED]\""
     "#<PG::Config host: #{host.inspect}, port: #{port}, user: #{user.inspect}, password: #{shown}, " \
       "database: #{database.inspect}, application_name: #{application_name.inspect}, " \
-      "sslmode: #{sslmode.inspect}, sslrootcert: #{sslrootcert.inspect}, options: #{options.inspect}>"
+      "sslmode: #{sslmode.inspect}, sslrootcert: #{sslrootcert.inspect}, options: #{options.inspect}, " \
+      "require_auth: #{require_auth.inspect}>"
   end
 
   def to_s -> String = inspect
+
+  # The methods libpq's `require_auth` text allows: a comma-separated list
+  # of `password`, `md5`, `scram-sha-256`, `none`, `gss` and `sspi`, or of
+  # those each after `!`, which allows every method but them (pg#49).
+  # Raises [ArgumentError] for an empty list, an unknown method, or
+  # negated and plain methods mixed.
+  #
+  # ```
+  # PG::Config.require_auth("scram-sha-256")   # => [:scram_sha_256]
+  # PG::Config.require_auth("!md5,!none")      # => [:password, :scram_sha_256, :gss, :sspi]
+  # ```
+  def self.require_auth(text: String) -> Array[Symbol]
+    methods = {"password" => :password, "md5" => :md5, "scram-sha-256" => :scram_sha_256,
+               "none" => :none, "gss" => :gss, "sspi" => :sspi}
+    names = text.split(",").map(&:strip)
+    raise ArgumentError.new("require_auth: empty") if names.empty? || names.any?(&:empty?)
+    negated = names.count { |n| n.start_with?("!") }
+    unless negated == 0 || negated == names.size
+      raise ArgumentError.new("require_auth: negated and plain methods mixed")
+    end
+    picked = names.map do |n|
+      methods[n.delete_prefix("!")]? ||
+        raise(ArgumentError.new("require_auth: not one of password, md5, scram-sha-256, none, gss, sspi (or each after !)"))
+    end
+    return picked.uniq if negated == 0
+    methods.values.reject { |m| picked.include?(m) }
+  end
 end
 
 # Reads a connection URL, as libpq does:
@@ -60,7 +95,8 @@ end
 # `sslrootcert` (a PEM file's path, or `system`, which makes `sslmode`
 # `verify-full` unless given, and refuses a weaker one) and `options`
 # (server settings for the session, `-c name=value` each, as libpq
-# sends them: [Config#options]) are read.
+# sends them: [Config#options]) and `require_auth` (libpq's list of the
+# authentication methods allowed: [Config.require_auth]) are read.
 # `channel_binding` may be `disable` or `prefer` (no channel binding
 # either way) and `sslnegotiation` `postgres`.
 # Client certificates (`sslcert`, `sslkey`, `sslpassword`), `sslcrl`
@@ -103,6 +139,7 @@ public def parse_url(url: String) -> Config
   sslmode: Symbol? = nil
   sslrootcert: String? = nil
   options: String? = nil
+  require_auth: Array[Symbol]? = nil
   (m[5] || "").split("&").each do |pair|
     next if pair.empty?
     key, _, value = pair.partition("=")
@@ -133,6 +170,7 @@ public def parse_url(url: String) -> Config
         raise ArgumentError.new("channel_binding: this client has no channel binding (disable or prefer only)")
       end
     when "options" then options = value
+    when "require_auth" then require_auth = Config.require_auth(value)
     when "sslnegotiation"
       unless value == "postgres"
         raise ArgumentError.new("sslnegotiation: this client negotiates TLS the postgres way only")
@@ -152,7 +190,7 @@ public def parse_url(url: String) -> Config
              connect_timeout: connect_timeout, max_scram_iterations: max_scram_iterations,
              statement_cache_size: statement_cache_size,
              sslmode: Config.sslmode(sslmode, sslrootcert), sslrootcert: sslrootcert,
-             options: options)
+             options: options, require_auth: require_auth)
 end
 
 extension Config

@@ -220,7 +220,7 @@ class ConnectionFailureTest < Test::Case
   # The password message a client sends to a server that asks with
   # `request` (an Authentication message's body), the connection given
   # `password`.
-  def password_sent(request: Bytes, password: String | Bytes::Secret) -> Bytes
+  def password_sent(request: Bytes, password: String | Bytes::Secret, require_auth: String? = "password,md5") -> Bytes
     server = TCPServer.new("127.0.0.1", 0)
     port = server.local_address.port
     sent = Task.scope do |scope|
@@ -236,12 +236,85 @@ class ConnectionFailureTest < Test::Case
       end
       assert_raise(PG::ConnectionError) do
         PG.connect(host: "127.0.0.1", port: port, user: "ann", password: password, sslmode: :disable,
-                   allow_cleartext: true)
+                   allow_cleartext: true, require_auth: require_auth)
       end
       got.await
     end
     server.close
     sent
+  end
+
+  # pg#49: what a client does when a stand-in server over plain TCP asks
+  # with `request`: the AuthenticationError's message, or "sent" when it
+  # answered (the stand-in then closes, a ConnectionError).
+  def auth_outcome(request: Bytes, require_auth: String?) -> String
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.local_address.port
+    outcome = Task.scope do |scope|
+      got = scope.spawn do
+        peer = server.accept
+        size = peer.read_bytes(4)
+        peer.read_bytes(((size[0] << 24) | (size[1] << 16) | (size[2] << 8) | size[3]) - 4)
+        peer.write(PG::Wire.frame('R'.ord, request))
+        answer = peer.read_bytes(1)
+        peer.close
+        answer
+      end
+      result = begin
+        PG.connect(host: "127.0.0.1", port: port, user: "ann", password: "pw", sslmode: :disable,
+                   allow_cleartext: true, require_auth: require_auth)
+        "connected"
+      rescue PG::AuthenticationError => e
+        e.message
+      rescue PG::ConnectionError, PG::ProtocolError
+        "sent"
+      end
+      answer = got.await
+      # Refused: nothing was sent to the stand-in.
+      assert_true(answer.empty?, "sent #{answer.inspect} though refused") unless result == "sent"
+      result
+    end
+    server.close
+    outcome
+  end
+
+  MD5_REQUEST = b"\x00\x00\x00\x05\x01\x02\x03\x04"
+  OK = b"\x00\x00\x00\x00"
+
+  def test_md5_and_none_refused_from_an_unauthenticated_server
+    assert_equal("the server asked for md5 password authentication over a connection that does not authenticate it " +
+                 "(a unix socket, or TLS verified against roots); pass require_auth: \"md5\" to allow it",
+                 auth_outcome(MD5_REQUEST, nil))
+    assert_equal("the server asked for no authentication over a connection that does not authenticate it " +
+                 "(a unix socket, or TLS verified against roots); pass require_auth: \"none\" to allow it",
+                 auth_outcome(OK, nil))
+  end
+
+  def test_require_auth_lists_what_is_allowed
+    assert_equal("sent", auth_outcome(MD5_REQUEST, "md5"))
+    assert_equal("sent", auth_outcome(MD5_REQUEST, "!none"))
+    assert_equal("the server asked for md5 password authentication, which require_auth does not allow",
+                 auth_outcome(MD5_REQUEST, "scram-sha-256"))
+    assert_equal("the server asked for md5 password authentication, which require_auth does not allow",
+                 auth_outcome(MD5_REQUEST, "!md5"))
+    assert_equal("the server asked for no authentication, which require_auth does not allow",
+                 auth_outcome(OK, "scram-sha-256,md5"))
+    assert_equal("the server asked for a password in clear, which require_auth does not allow",
+                 auth_outcome(b"\x00\x00\x00\x03", "md5"))
+  end
+
+  def test_require_auth_text
+    assert_equal([:scram_sha_256], PG::Config.require_auth("scram-sha-256"))
+    assert_equal([:md5, :scram_sha_256], PG::Config.require_auth("md5, scram-sha-256,md5"))
+    assert_equal([:password, :scram_sha_256, :gss, :sspi], PG::Config.require_auth("!md5,!none"))
+    assert_equal([:md5], PG.parse_url("postgres://h/d?require_auth=md5").require_auth)
+    assert_nil(PG.parse_url("postgres://h/d").require_auth)
+    e = assert_raise(ArgumentError) { PG::Config.require_auth("md5,!none") }
+    assert_equal("require_auth: negated and plain methods mixed", e.message)
+    e = assert_raise(ArgumentError) { PG::Config.require_auth("kerberos") }
+    assert_equal("require_auth: not one of password, md5, scram-sha-256, none, gss, sspi (or each after !)", e.message)
+    assert_raise(ArgumentError) { PG::Config.require_auth("") }
+    assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?require_auth=md5,,none") }
   end
 
   # A Bytes::Secret password sends what its String sends.

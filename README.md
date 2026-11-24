@@ -23,7 +23,11 @@ Work in progress. What exists:
 - `PG.connect(url)` / `PG.connect(host:, port:, user:, password:, ...)`:
   TCP or a unix socket (a `host` starting with `/`), authentication by
   SCRAM-SHA-256 ([PG::Scram]), md5, cleartext (over a unix socket, or
-  with `allow_cleartext: true`) or trust, `connect_timeout`. Server
+  with `allow_cleartext: true`) or trust, `connect_timeout`. md5 and trust
+  are accepted only from a server authenticated otherwise (a unix socket,
+  or TLS verified against roots) unless `require_auth` (libpq's syntax:
+  `?require_auth=md5`, `require_auth: "scram-sha-256"`) lists them: anyone
+  answering as the server could otherwise ask for them. Server
   errors raise [PG::ServerError] (SQLSTATE `code`, `detail`, `hint`, ...).
   `options` (keyword or URL parameter, as libpq's) sends server
   settings for the session at startup:

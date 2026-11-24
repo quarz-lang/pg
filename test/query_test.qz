@@ -452,7 +452,13 @@ class QueryTest < Test::Case
     admin.exec("CREATE ROLE md5_user LOGIN PASSWORD 'md5-secret'")
     admin.exec("RESET password_encryption")
     admin.exec("CREATE ROLE clear_user LOGIN PASSWORD 'clear-secret'")
-    c = PG.connect(host: "127.0.0.1", port: server.port, user: "md5_user", password: "md5-secret", database: "postgres")
+    # md5 from a server not authenticated otherwise (plain TCP): only
+    # when require_auth allows it (pg#49).
+    assert_raise_message(/require_auth: "md5"/) do
+      PG.connect(host: "127.0.0.1", port: server.port, user: "md5_user", password: "md5-secret", database: "postgres")
+    end
+    c = PG.connect(host: "127.0.0.1", port: server.port, user: "md5_user", password: "md5-secret", database: "postgres",
+                   require_auth: "md5")
     assert_equal("md5_user", c.exec("SELECT current_user").rows[0].string(0))
     c.close
     assert_raise_message(/in clear over TCP/) do

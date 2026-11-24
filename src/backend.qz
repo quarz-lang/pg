@@ -98,11 +98,25 @@ enum Backend
               when "s" then PortalSuspended
               when "t" then ParameterDescription.new(Array.new(r.uint16) { r.uint32 })
               when "A" then NotificationResponse.new(r.int32, r.cstring, r.cstring)
-              when "v" then NegotiateProtocolVersion.new(r.int32, Array.new(r.int32) { r.cstring })
+              when "v" then negotiate(r)
               else raise ProtocolError.new("unknown message type #{type.chr.inspect}")
               end
     raise ProtocolError.new("#{r.remaining} bytes after a #{type.chr.inspect} message") unless r.done?
     message
+  end
+
+  # NegotiateProtocolVersion: the newest minor version the server speaks
+  # and the options it did not recognise. The count is the peer's: each
+  # option takes at least its NUL, so a count over the bytes left is
+  # refused before anything is made for it (an `Array.new` of a count
+  # near 2^31 reserves its room first, #48).
+  private def self.negotiate(r: Wire::Reader) -> Backend
+    version = r.int32
+    count = r.int32
+    if count < 0 || count > r.remaining
+      raise ProtocolError.new("a NegotiateProtocolVersion message counts #{count} options in #{r.remaining} bytes")
+    end
+    NegotiateProtocolVersion.new(version, Array.new(count) { r.cstring })
   end
 
   private def self.authentication(r: Wire::Reader) -> Backend

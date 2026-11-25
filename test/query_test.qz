@@ -223,6 +223,32 @@ class QueryTest < Test::Case
     assert_raise(IndexError) { row["nope"] }
   end
 
+  # #68: a String parameter holding a NUL is refused before anything is
+  # sent, an array's element too, the value not shown: the transaction
+  # it came in goes on.
+  def test_a_nul_in_a_string_parameter_is_refused_before_sending
+    message = "a String parameter holding a NUL, which PostgreSQL's text cannot hold"
+    ["a\0b", "\0", "secret\0"].each do |v|
+      e = assert_raise(ArgumentError) { PG::Connection.encode(v) }
+      assert_equal(message, e.message)
+    end
+    e = assert_raise(ArgumentError) { PG::Connection.encode(["ok", nil, "x\0y"]) }
+    assert_equal(message, e.message)
+    assert_equal(b"a b", PG::Connection.encode("a b"))
+    c = conn
+    c.exec("CREATE TEMP TABLE nul_t (s text)")
+    got = c.transaction do |tx|
+      tx.query("INSERT INTO nul_t VALUES ($1)", ["before"])
+      assert_raise(ArgumentError) { tx.query("INSERT INTO nul_t VALUES ($1)", ["secret\0value"]) }
+      assert_raise(ArgumentError) { tx.query("SELECT $1::text[]", [["a", "b\0"]]) }
+      assert_equal(:in_transaction, tx.transaction_status)
+      tx.query("INSERT INTO nul_t VALUES ($1)", ["after"])
+      tx.query("SELECT s FROM nul_t ORDER BY s").rows.map { |r| r.string(0) }
+    end
+    assert_equal(["after", "before"], got)
+    assert_equal(2, c.exec("SELECT count(*) FROM nul_t").rows[0].int(0))
+  end
+
   def test_errors_leave_the_connection_usable
     c = conn
     e = assert_raise(PG::ServerError) { c.exec("SELECT * FROM no_such_table") }.as(PG::ServerError)

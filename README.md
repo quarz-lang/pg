@@ -269,7 +269,10 @@ For now, to be revisited:
   handshake (a stale `root.crt` included) is an error (libpq tries
   again in plain).
 - A SCRAM iteration count above 1,000,000 is refused unless the
-  connection raises `max_scram_iterations` (keyword or URL parameter).
+  connection raises `max_scram_iterations`, and one below 4096 (the
+  minimum RFC 7677 recommends, PostgreSQL's default) unless it lowers
+  `min_scram_iterations` (keywords or URL parameters), for a server
+  whose administrator set `scram_iterations` lower.
 
 ## Development
 

@@ -8,8 +8,10 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 # Connects as `PG.connect(url)` does, from keywords: `host` is a host name
 # or address, or a directory holding the server's unix socket (a path
 # starting with `/`). A password is sent in clear only over a unix socket,
-# or when `allow_cleartext` says so. `max_scram_iterations` is the most
-# SCRAM iterations the server may ask for, `statement_cache_size` how many
+# or when `allow_cleartext` says so. `min_scram_iterations` and
+# `max_scram_iterations` are the fewest and the most SCRAM iterations the
+# server may ask for (4096 and 1,000,000 by default; [PG::Scram]),
+# `statement_cache_size` how many
 # prepared statements [PG::Connection#query] keeps. `options` holds server
 # settings for the session, as libpq's `options` (`-c search_path=app`),
 # which the server applies at startup ([PG::Config#options]).
@@ -59,6 +61,7 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 public def connect(*, host: String = "localhost", port: Int = 5432, user: String = Config.default_user,
                    password: (String | Bytes::Secret)? = nil, database: String? = nil, application_name: String? = nil,
                    allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
+                   min_scram_iterations: Int = Scram::MIN_ITERATIONS,
                    max_scram_iterations: Int = Scram::MAX_ITERATIONS,
                    statement_cache_size: Int = Connection::STATEMENT_CACHE_SIZE,
                    sslmode: Symbol? = nil, sslrootcert: String? = nil, options: String? = nil,
@@ -73,7 +76,8 @@ public def connect(*, host: String = "localhost", port: Int = 5432, user: String
   Connection.open(Config.new(host:, port:, user:, password:, database:, application_name:,
                              allow_cleartext:, connect_timeout:, max_scram_iterations:,
                              statement_cache_size:, sslmode: Config.sslmode(sslmode, sslrootcert),
-                             sslrootcert:, options:, require_auth: (t = require_auth) ? Config.require_auth(t) : nil))
+                             sslrootcert:, options:, require_auth: (t = require_auth) ? Config.require_auth(t) : nil,
+                             min_scram_iterations:))
 end
 
 # Raises `ArgumentError` for a channel name the server cannot take as
@@ -950,6 +954,8 @@ class Connection
 
   private def authenticate -> Void
     scram: Scram? = nil
+    # Whether the server sent its SCRAM challenge (SASLContinue).
+    continued = false
     # Whether the server asked for any method before AuthenticationOk.
     asked = false
     loop do
@@ -982,11 +988,16 @@ class Connection
         refuse_after_sasl(scram)
         asked = true
         allow_method(:scram_sha_256)
-        s = Scram.new(password, max_iterations: @config.max_scram_iterations)
+        s = Scram.new(password, min_iterations: @config.min_scram_iterations,
+                      max_iterations: @config.max_scram_iterations)
         scram = s
         send(Frontend.sasl_initial_response(Scram::MECHANISM, s.client_first.to_bytes))
       in Backend::AuthenticationSASLContinue(data:)
         s = scram || unexpected(m, "before SASL started")
+        # One challenge per exchange: answering more would hash again
+        # for as long as the server asks.
+        unexpected(m, "after the client's proof") if continued
+        continued = true
         send(Frontend.sasl_response(s.client_final(text(data)).to_bytes))
       in Backend::AuthenticationSASLFinal(data:)
         s = scram || unexpected(m, "before SASL started")

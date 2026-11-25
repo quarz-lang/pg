@@ -22,6 +22,13 @@ class Scram
   # administrator may raise `scram_iterations`).
   MAX_ITERATIONS = 1_000_000
 
+  # The fewest PBKDF2 rounds a server may ask for, unless the connection
+  # says otherwise (`min_scram_iterations`): the minimum RFC 7677
+  # recommends, and PostgreSQL's default. Whoever answers as the server
+  # could otherwise ask for one round and get a proof that is cheap to
+  # guess the password from.
+  MIN_ITERATIONS = 4096
+
   # Above this many rounds, the hashing runs on a helper thread
   # ([Task.blocking]), so that the worker's other tasks go on meanwhile.
   BLOCKING_ITERATIONS = 10_000
@@ -29,6 +36,7 @@ class Scram
   @password: String | Bytes::Secret
   @nonce: String
   @user: String
+  @min_iterations: Int
   @max_iterations: Int
   var @auth_message: String? = nil
   var @server_signature: Bytes? = nil
@@ -40,7 +48,8 @@ class Scram
   # `srand` repeats and whose output on the wire would give its state away
   # (#50).
   def initialize(@password: String | Bytes::Secret, nonce: String? = nil, user: String = "",
-                 max_iterations: Int = MAX_ITERATIONS)
+                 min_iterations: Int = MIN_ITERATIONS, max_iterations: Int = MAX_ITERATIONS)
+    @min_iterations = min_iterations
     @max_iterations = max_iterations
     @nonce = nonce || Base64.encode(Crypto.random_bytes(18))
     @user = user.gsub("=", "=3D").gsub(",", "=2C")
@@ -62,6 +71,10 @@ class Scram
     count = attrs["i"]? || fail("no iteration count")
     fail("an iteration count of #{count.inspect}") unless count.match?(/\A[1-9][0-9]{0,9}\z/)
     rounds = count.to_i
+    if rounds < @min_iterations
+      fail("the server asks for #{rounds} iterations, fewer than the #{@min_iterations} required " +
+           "(lower the connection's min_scram_iterations to accept it)")
+    end
     if rounds > @max_iterations
       fail("the server asks for #{rounds} iterations, more than the #{@max_iterations} allowed " +
            "(raise the connection's max_scram_iterations to accept it)")

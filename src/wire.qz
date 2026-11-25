@@ -164,10 +164,14 @@ class MessageReader
   MAX_LENGTH = 0x4000_0000 + 0x1000
 
   @read: (Int) -> Bytes
+  # Waits until a read would not wait, for at most its argument; false
+  # when that passed first (nil: [read_within] never stops early).
+  @wait: ((Duration) -> Bool)? = nil
 
   # Reads from `io` (a socket).
   def initialize(io: IO)
     @read = ->(n: Int) { io.read_bytes(n) }
+    @wait = ->(t: Duration) { io.wait_readable(timeout: t) }
   end
 
   # Reads with [read], which gives up to its argument's count of bytes
@@ -176,25 +180,38 @@ class MessageReader
 
   # The next message. Raises [PG::ConnectionError] when the stream ends,
   # and [PG::ProtocolError] for a message that does not parse.
-  def read -> Backend
-    header = Wire::Reader.new(exactly(5))
+  def read -> Backend = read_within(nil) || raise ConnectionError.new("the server closed the connection")
+
+  # As [#read], or nil when `deadline` ([Time.monotonic]; nil: none)
+  # passes while the message is not whole: each read that would wait
+  # waits only until then, and one that would not (bytes buffered) is
+  # never cut. What was read of a message cut short is lost: the stream
+  # is out of step after nil.
+  def read_within(deadline: Duration?) -> Backend?
+    head = exactly(5, deadline) || return nil
+    header = Wire::Reader.new(head)
     type = header.byte
     length = header.int32
     if length < 4 || length > MAX_LENGTH
       raise ProtocolError.new("a #{type.chr.inspect} message of length #{length}")
     end
-    Backend.decode(type, exactly(length - 4))
+    body = exactly(length - 4, deadline) || return nil
+    Backend.decode(type, body)
   end
 
-  private def exactly(n: Int) -> Bytes
+  # `n` bytes, or nil when `deadline` passes before they arrive.
+  private def exactly(n: Int, deadline: Duration?) -> Bytes?
     return Bytes.new if n == 0
-    first = @read.(n)
-    raise ConnectionError.new("the server closed the connection") if first.empty?
-    return first if first.size == n
-    b = Bytes::Builder.new << first
+    b = Bytes::Builder.new
     while b.size < n
+      if deadline && (wait = @wait)
+        left = deadline - Time.monotonic
+        return nil unless wait.(left > 0.seconds ? left : 0.seconds)
+      end
       more = @read.(n - b.size)
       raise ConnectionError.new("the server closed the connection") if more.empty?
+      # (Whole at the first read, as most are: no copy.)
+      return more if more.size == n
       b << more
     end
     b.to_bytes

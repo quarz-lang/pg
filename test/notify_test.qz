@@ -69,6 +69,88 @@ class NotifyTest < Test::Case
     end
   end
 
+  # pg#52: a connection to a stand-in server that answers the startup
+  # (no authentication, idle), then, for each of `parts`, waits its
+  # pause and writes its bytes, and holds the connection until `release`
+  # gets a value (or 5 seconds pass).
+  def stand_in(parts: Array[[Duration, Bytes]], release: Channel[Nil], &: (PG::Connection) -> Void) -> Void
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.local_address.port
+    Task.scope do |scope|
+      peer_task = scope.spawn do
+        peer = server.accept
+        size = peer.read_bytes(4)
+        peer.read_bytes(((size[0] << 24) | (size[1] << 16) | (size[2] << 8) | size[3]) - 4)
+        peer.write(PG::Wire.frame('R'.ord, b"\x00\x00\x00\x00") + PG::Wire.frame('Z'.ord, b"I"))
+        parts.each do |part|
+          Task.sleep(part[0])
+          peer.write(part[1])
+        end
+        begin
+          Task.timeout(5.seconds) { release.receive? }
+        rescue Task::Timeout
+        end
+        peer.close
+      end
+      conn = PG.connect(host: "127.0.0.1", port: port, user: "ann", sslmode: :disable, require_auth: "none")
+      begin
+        yield conn
+      ensure
+        conn.close
+        release.try_send(nil)
+        peer_task.await
+      end
+    end
+    server.close
+  end
+
+  # A NotificationResponse from process 7 on `channel` with `payload`.
+  def notification(channel: String, payload: String) -> Bytes
+    body = Bytes::Builder.new
+    body << b"\x00\x00\x00\x07" << channel.to_bytes << 0 << payload.to_bytes << 0
+    PG::Wire.frame('A'.ord, body.to_bytes)
+  end
+
+  def test_a_message_cut_by_the_timeout_closes_the_connection
+    release = Channel[Nil].new(1)
+    stand_in([[0.seconds, notification("jobs", "x").slice(0, 1)]], release) do |conn|
+      started = Time.monotonic
+      e = assert_raise(PG::ConnectionError) { conn.wait_for_notify(timeout: 300.ms) }
+      assert_equal("a message from the server was not whole when the timeout passed: the connection is closed", e.message)
+      # (The stand-in holds the connection for 5 seconds.)
+      assert_true(Time.monotonic - started < 3.seconds)
+      assert_true(conn.closed?)
+    end
+  end
+
+  def test_a_message_in_two_parts_within_the_timeout
+    whole = notification("jobs", "split")
+    release = Channel[Nil].new(1)
+    stand_in([[0.seconds, whole.slice(0, 6)], [100.ms, whole.slice(6, whole.size - 6)]], release) do |conn|
+      n = conn.wait_for_notify(timeout: 5.seconds) || raise "no notification"
+      assert_equal(["jobs", "split", 7], [n.channel, n.payload, n.process_id])
+      assert_false(conn.closed?)
+    end
+  end
+
+  # A message already whole when the time left is none is read, not cut:
+  # the stand-in writes it at once, and the wait has no time left at all.
+  def test_a_whole_message_at_the_deadline_is_read
+    release = Channel[Nil].new(1)
+    stand_in([[0.seconds, notification("jobs", "now")]], release) do |conn|
+      # (Until the bytes are there: a timeout of zero does not wait for them.)
+      n = conn.wait_for_notify(timeout: 0.seconds)
+      tries = 0
+      while n.nil? && tries < 100
+        Task.sleep(10.ms)
+        tries += 1
+        n = conn.wait_for_notify(timeout: 0.seconds)
+      end
+      assert_equal("now", (n || raise "no notification").payload)
+      assert_false(conn.closed?)
+    end
+  end
+
   def test_a_timeout_returns_nil_and_the_connection_goes_on
     pair do |listener, _|
       listener.listen("quiet")

@@ -62,9 +62,38 @@ module Testing
     def url -> String = @url
 
     # The server as text, the URL's password left out as [PG::Config#inspect]
-    # does (a failed test prints its values).
+    # does (a failed test prints its values): `[FILTERED]` in its place,
+    # in the user part and in a `password=` parameter.
+    #
+    # ```
+    # PG::Testing::Server.new("postgres://ann:pw@127.0.0.1:5432/shop", nil, "/usr/bin").inspect
+    # # => "#<PG::Testing::Server url: \"postgres://ann:[FILTERED]@127.0.0.1:5432/shop\", dir: nil>"
+    # ```
     def inspect -> String
-      "#<PG::Testing::Server config: #{cog.parse_url(@url).inspect}, dir: #{@dir.inspect}>"
+      "#<PG::Testing::Server url: #{Server.masked(@url).inspect}, dir: #{@dir.inspect}>"
+    end
+
+    # :nodoc:
+    # `url` with its password replaced by `[FILTERED]`, read as text: the
+    # user part's password (after the first `:` of what comes before the
+    # last `@` of the authority) and the value of a `password` parameter.
+    # (Not [PG.parse_url], which reads the environment for defaults: a
+    # value's text must not, so that `to_s` can run where the environment
+    # cannot, as a compile-time statement's argument.)
+    def self.masked(url: String) -> String
+      scheme, sep, rest = url.partition("://")
+      return url if sep.empty?
+      cut = rest.index(/[\/?]/) || rest.size
+      authority = rest[0, cut]
+      tail = rest[cut, rest.size - cut]
+      if (at = authority.rindex("@"))
+        user = authority[0, at]
+        if (colon = user.index(":"))
+          authority = "#{user[0, colon]}:[FILTERED]#{authority[at, authority.size - at]}"
+        end
+      end
+      tail = tail.gsub(/[?&]password=[^&]*/) { |m| "#{m.partition("=")[0]}=[FILTERED]" }
+      "#{scheme}://#{authority}#{tail}"
     end
 
     def to_s -> String = inspect

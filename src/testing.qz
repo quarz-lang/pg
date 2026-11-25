@@ -61,6 +61,14 @@ module Testing
     # A URL to connect to it, with its password.
     def url -> String = @url
 
+    # The server as text, the URL's password left out as [PG::Config#inspect]
+    # does (a failed test prints its values).
+    def inspect -> String
+      "#<PG::Testing::Server config: #{cog.parse_url(@url).inspect}, dir: #{@dir.inspect}>"
+    end
+
+    def to_s -> String = inspect
+
     # Whether it is a cluster of ours (whose `pg_hba.conf` has the lines
     # `start` was given), not PG_TEST_URL's server.
     def ours? -> Bool = !@dir.nil?

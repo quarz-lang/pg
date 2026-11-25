@@ -86,6 +86,20 @@ data Config(
   end
 end
 
+# :nodoc:
+# A connection URL's parts ([Config.url_parts]): the scheme; the user
+# part's name as written and decoded, and its password, decoded (nil
+# when the URL has none); the text from the host to the query, as
+# written; the host, the port as written (empty: none), the database
+# (empty: none), decoded; and the query's pairs, nil without a query.
+data UrlParts = (scheme: String, user_text: String?, user: String?, password: String?, middle: String,
+              host: String, port: String, database: String, pairs: Array[UrlPair]?)
+
+# :nodoc:
+# A `name=value` of a URL's query: as written, and its name and value
+# decoded.
+data UrlPair = (raw: String, name: String, value: String)
+
 # Reads a connection URL, as libpq does:
 # `postgres://user:password@host:port/database?param=value`
 # (`postgresql://` too). The parts are percent-decoded; `host` may be a
@@ -120,20 +134,21 @@ end
 # PG.parse_url("postgres://h/d?sslcert=client.pem")  # raises ArgumentError
 # ```
 public def parse_url(url: String) -> Config
-  m = url.match(/\Apostgres(?:ql)?:\/\/(?:([^@\/?#]*)@)?(\[[^\]\/]*\]|[^:\/?#]*)(?::([0-9]*))?(?:\/([^?#]*))?(?:\?([^#]*))?\z/)
-  raise ArgumentError.new(Config.refusal(url)) unless m
-  user: String? = nil
-  password: String? = nil
-  if (info = m[1])
-    name, colon, secret = info.partition(":")
-    user = Config.unescape(name)
-    password = Config.unescape(secret) unless colon.empty?
-  end
-  host = m[2] || ""
-  host = host[1, host.size - 2] if host.start_with?("[")
-  host = Config.unescape(host)
-  port = (m[3] || "").empty? ? 5432 : Config.port(m[3] || "")
-  database = (m[4] || "").empty? ? nil : Config.unescape(m[4] || "")
+  config, user_given = read_url(url)
+  user_given ? config : config.with(user: Config.default_user)
+end
+
+# What [PG.parse_url] reads, with the same errors, without the
+# environment: the configuration, its user empty when the URL names none,
+# and whether it names one. (A value's text may be made at compile time,
+# where the environment cannot be read: [PG::Testing::Server#inspect].)
+def read_url(url: String) -> [Config, Bool]
+  parts = Config.url_parts(url)
+  user = parts.user
+  password = parts.password
+  host = parts.host
+  port = parts.port.empty? ? 5432 : Config.port(parts.port)
+  database = parts.database.empty? ? nil : parts.database
   application_name: String? = nil
   connect_timeout: Duration? = nil
   min_scram_iterations = Scram::MIN_ITERATIONS
@@ -143,11 +158,10 @@ public def parse_url(url: String) -> Config
   sslrootcert: String? = nil
   options: String? = nil
   require_auth: Array[Symbol]? = nil
-  (m[5] || "").split("&").each do |pair|
-    next if pair.empty?
-    key, _, value = pair.partition("=")
-    value = Config.unescape(value)
-    name = Config.unescape(key)
+  (parts.pairs || Array[UrlPair].new).each do |pair|
+    next if pair.raw.empty?
+    name = pair.name
+    value = pair.value
     case name
     when "host" then host = value
     when "port" then port = Config.port(value)
@@ -190,13 +204,14 @@ public def parse_url(url: String) -> Config
       raise ArgumentError.new("an unknown parameter in the URL's query (its name is not quoted: it may be a password)")
     end
   end
-  Config.new(host: host.empty? ? "localhost" : host, port: port,
-             user: user || Config.default_user, password: password, database: database,
-             application_name: application_name, allow_cleartext: false,
-             connect_timeout: connect_timeout, max_scram_iterations: max_scram_iterations,
-             statement_cache_size: statement_cache_size,
-             sslmode: Config.sslmode(sslmode, sslrootcert), sslrootcert: sslrootcert,
-             options: options, require_auth: require_auth, min_scram_iterations: min_scram_iterations)
+  config = Config.new(host: host.empty? ? "localhost" : host, port: port,
+                      user: user || "", password: password, database: database,
+                      application_name: application_name, allow_cleartext: false,
+                      connect_timeout: connect_timeout, max_scram_iterations: max_scram_iterations,
+                      statement_cache_size: statement_cache_size,
+                      sslmode: Config.sslmode(sslmode, sslrootcert), sslrootcert: sslrootcert,
+                      options: options, require_auth: require_auth, min_scram_iterations: min_scram_iterations)
+  [config, !user.nil?]
 end
 
 extension Config
@@ -223,6 +238,40 @@ extension Config
       return "not a postgres:// URL: the user information is malformed, or the host or the port (a `/`, `?`, `#` or `@` in a user name or password must be written %2F, %3F, %23 or %40)"
     end
     "not a postgres:// URL: the host or the port is malformed"
+  end
+
+  # :nodoc:
+  # `url` cut into its parts as [PG.parse_url] reads them, decoded, with
+  # what [PG::Testing::Server#inspect] shows: the user part as written
+  # and the text between it and the query. Reads no environment (a
+  # value's text may be made at compile time). Raises [ArgumentError] for
+  # a URL the grammar refuses or a malformed escape, as [PG.parse_url]
+  # does.
+  def self.url_parts(url: String) -> UrlParts
+    m = url.match(/\Apostgres(?:ql)?:\/\/(?:([^@\/?#]*)@)?(\[[^\]\/]*\]|[^:\/?#]*)(?::([0-9]*))?(?:\/([^?#]*))?(?:\?([^#]*))?\z/)
+    raise ArgumentError.new(Config.refusal(url)) unless m
+    scheme = url.partition("://")[0]
+    rest = url[scheme.size + 3, url.size - scheme.size - 3]
+    user: String? = nil
+    password: String? = nil
+    user_text: String? = nil
+    if (info = m[1])
+      name, colon, secret = info.partition(":")
+      user = Config.unescape(name)
+      password = Config.unescape(secret) unless colon.empty?
+      user_text = name
+      rest = rest[info.size + 1, rest.size - info.size - 1]
+    end
+    host = m[2] || ""
+    host = host[1, host.size - 2] if host.start_with?("[")
+    host = Config.unescape(host)
+    database = Config.unescape(m[4] || "")
+    pairs = (m[5] || "").split("&").map do |pair|
+      key, _, value = pair.partition("=")
+      v = Config.unescape(value)
+      UrlPair.new(pair, Config.unescape(key), v)
+    end
+    UrlParts.new(scheme, user_text, user, password, rest.partition("?")[0], host, m[3] || "", database, m[5].nil? ? nil : pairs)
   end
 
   # `text` with its `%XX` escapes decoded. Raises [ArgumentError] on a

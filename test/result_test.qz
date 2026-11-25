@@ -1,0 +1,20 @@
+require "test"
+
+# Conversions of what a server sends that need no server: their errors
+# are the documented ones, under PG::Error or ArgumentError (pg#54).
+class ResultTest < Test::Case
+  def test_affected_count_that_does_not_fit
+    assert_equal(9_223_372_036_854_775_807, PG::Result.new([], [], "UPDATE 9223372036854775807").affected)
+    e = assert_raise(PG::ProtocolError) { PG::Result.new([], [], "UPDATE 9223372036854775808").affected }
+    assert_equal("a command tag whose count does not fit an Int: \"UPDATE 9223372036854775808\"", e.message)
+    assert_raise(PG::ProtocolError) { PG::Result.new([], [], "INSERT 0 99999999999999999999").affected }
+  end
+
+  def test_time_a_time_cannot_hold
+    e = assert_raise(ArgumentError) { PG::Row.parse_time("0000-01-01") }
+    assert_equal("0000-01-01: a Time cannot hold it (read the column as a string)", e.message)
+    assert_raise(ArgumentError) { PG::Row.parse_time("0000-12-31 23:59:59+00") }
+    assert_raise(ArgumentError) { PG::Row.parse_time("9999-12-31") }
+    assert_equal(Time.utc(1677, 9, 22), PG::Row.parse_time("1677-09-22"))
+  end
+end

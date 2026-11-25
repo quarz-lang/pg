@@ -22,4 +22,15 @@ class TestingTest < Test::Case
       assert_raise(PG::ConnectionError) { PG.connect(url) }
     end
   end
+
+  # A failed test prints the server: its password stays out.
+  def test_inspect_leaves_the_password_out
+    server = PG::Testing::Server.new("postgres://ann:s3cr3t-pw@127.0.0.1:5432/shop", nil, "/usr/bin")
+    text = server.inspect
+    refute(text.include?("s3cr3t-pw"))
+    assert(text.include?("[FILTERED]"))
+    assert(text.include?("127.0.0.1"))
+    assert_equal(text, server.to_s)
+    refute("#{server}".include?("s3cr3t-pw"))
+  end
 end

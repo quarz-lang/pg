@@ -25,7 +25,8 @@ class Result
 
   # How many rows the statement inserted, updated, deleted, selected,
   # moved, fetched, copied or merged, from its tag; nil for a statement
-  # that does not count rows.
+  # that does not count rows. A count that does not fit an [Int] is a
+  # malformed tag: [PG::ProtocolError].
   #
   # ```
   # PG::Result.new([], [], "INSERT 0 3").affected   # => 3
@@ -33,7 +34,13 @@ class Result
   # ```
   def affected -> Int?
     m = @command_tag.match(/\A(?:INSERT \d+|UPDATE|DELETE|SELECT|MOVE|FETCH|COPY|MERGE) (\d+)\z/)
-    m && m[1]&.to_i
+    count = m && m[1]
+    return nil unless count
+    begin
+      count.to_i
+    rescue OverflowError
+      raise ProtocolError.new("a command tag whose count does not fit an Int: #{@command_tag.inspect}")
+    end
   end
 
   # The number of rows.
@@ -346,7 +353,9 @@ class Row
 
   # A timestamp, timestamptz or date in PostgreSQL's ISO output
   # (`2024-03-05 14:07:09.5+09`, `2024-03-05`): a value without an offset
-  # is UTC.
+  # is UTC. Raises [ArgumentError] for text that is not one, or for a
+  # value a [Time] cannot hold (`infinity`, or a time outside the range
+  # of a [Time], about 1677-09-21 to 2262-04-11).
   #
   # ```
   # PG::Row.parse_time("2024-03-05 14:07:09+09").utc_offset   # => 32400
@@ -370,7 +379,11 @@ class Row
            else
              "Z"
            end
-    Time.parse("#{date}T#{clock}#{zone}")
+    begin
+      Time.parse("#{date}T#{clock}#{zone}")
+    rescue RangeError
+      raise ArgumentError.new("#{text}: a Time cannot hold it (read the column as a string)")
+    end
   end
 
   # A `numeric` in PostgreSQL's output (`19.990`, `-0.5`, `1500`), its

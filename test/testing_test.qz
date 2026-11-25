@@ -34,26 +34,39 @@ class TestingTest < Test::Case
     refute("#{server}".include?("s3cr3t-pw"))
   end
 
-  # The URL as text, its password masked without reading it as a
-  # configuration (PG.parse_url reads the environment, which a `to_s` run
+  # The URL as PG.parse_url reads it, its password masked, without
+  # PG.parse_url itself (which reads the environment, which a `to_s` run
   # at compile time cannot reach).
   def test_inspect_masks_the_url_as_text
     shown = ->(url: String) { PG::Testing::Server.new(url, "/tmp/d", "/usr/bin").inspect }
-    assert_equal("#<PG::Testing::Server url: \"postgres://ann:[FILTERED]@127.0.0.1:5432/shop\", dir: \"/tmp/d\">",
-                 shown.call("postgres://ann:s3cr3t@127.0.0.1:5432/shop"))
-    assert_equal("#<PG::Testing::Server url: \"postgres://ann@127.0.0.1:5432/shop\", dir: \"/tmp/d\">",
-                 shown.call("postgres://ann@127.0.0.1:5432/shop"))
-    assert_equal("#<PG::Testing::Server url: \"postgres://127.0.0.1/shop?sslmode=disable\", dir: \"/tmp/d\">",
-                 shown.call("postgres://127.0.0.1/shop?sslmode=disable"))
-    # Escaped characters, a raw `@` and `:` in the password, a password
-    # parameter, and a quote and a backslash, which inspect escapes.
-    assert_equal("#<PG::Testing::Server url: \"postgres://a%40b:[FILTERED]@h/d\", dir: \"/tmp/d\">",
-                 shown.call("postgres://a%40b:p%2Fw%40rd@h/d"))
-    assert_equal("#<PG::Testing::Server url: \"postgres://ann:[FILTERED]@h/d\", dir: \"/tmp/d\">",
-                 shown.call("postgres://ann:p@ss:w@h/d"))
-    assert_equal("#<PG::Testing::Server url: \"postgres://h/d?user=ann&password=[FILTERED]&sslmode=disable\", dir: \"/tmp/d\">",
-                 shown.call("postgres://h/d?user=ann&password=s3cr3t&sslmode=disable"))
-    assert_equal("#<PG::Testing::Server url: \"postgres://a\\\"b:[FILTERED]@h/d\", dir: \"/tmp/d\">",
-                 shown.call("postgres://a\"b:x\\y@h/d"))
+    cases = [
+      ["postgres://ann:s3cret@127.0.0.1:5432/shop", "\"postgres://ann:[FILTERED]@127.0.0.1:5432/shop\""],
+      ["postgres://ann@127.0.0.1:5432/shop", "\"postgres://ann@127.0.0.1:5432/shop\""],
+      ["postgresql://127.0.0.1/shop?sslmode=disable", "\"postgresql://127.0.0.1/shop?sslmode=disable\""],
+      ["postgres://ann:@h/d", "\"postgres://ann:[FILTERED]@h/d\""],
+      # Escapes in the user part, kept as written.
+      ["postgres://a%40b:p%2Fw%40rd@h/d", "\"postgres://a%40b:[FILTERED]@h/d\""],
+      ["postgres://[::1]:5432/d", "\"postgres://[::1]:5432/d\""],
+      # Password parameters, by their decoded names, every one of them.
+      ["postgres://h/d?user=ann&password=s3cret&sslmode=disable", "\"postgres://h/d?user=ann&password=[FILTERED]&sslmode=disable\""],
+      ["postgres://h/d?pass%77ord=s3cret", "\"postgres://h/d?pass%77ord=[FILTERED]\""],
+      ["postgres://h/d?application_name=x&passw%6Frd=s3cret", "\"postgres://h/d?application_name=x&passw%6Frd=[FILTERED]\""],
+      ["postgres://h/d?password=a&password=b", "\"postgres://h/d?password=[FILTERED]&password=[FILTERED]\""],
+      # A quote and a backslash, which inspect escapes.
+      ["postgres://a\"b:x\\y@h/d", "\"postgres://a\\\"b:[FILTERED]@h/d\""],
+      # URLs parse_url refuses: never shown, not even in part.
+      ["postgres://ann:p/w@h/d", "[FILTERED]"],
+      ["postgres://ann:p@ss:w@h/d", "[FILTERED]"],
+      ["postgres://ann:pw@h/d?password=%zz", "[FILTERED]"],
+      ["postgres://ann:p%zzw@h/d", "[FILTERED]"],
+      ["mysql://ann:pw@h/d", "[FILTERED]"],
+      # A name parse_url does not know (passWord) may be a password.
+      ["postgres://h/d?pass%57ord=s3cret", "[FILTERED]"],
+      ["postgres://h/d?s3cret", "[FILTERED]"],
+      ["postgres://h/d?password=x&port=99999", "[FILTERED]"]
+    ]
+    cases.each do |c|
+      assert_equal("#<PG::Testing::Server url: #{c[1]}, dir: \"/tmp/d\">", shown.call(c[0]), c[0])
+    end
   end
 end

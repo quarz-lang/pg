@@ -63,37 +63,48 @@ module Testing
 
     # The server as text, the URL's password left out as [PG::Config#inspect]
     # does (a failed test prints its values): `[FILTERED]` in its place,
-    # in the user part and in a `password=` parameter.
+    # in the user part and in each `password` parameter (its name decoded,
+    # as [PG.parse_url] reads it), and as the whole URL when it is not one
+    # [PG.parse_url] can read.
     #
     # ```
     # PG::Testing::Server.new("postgres://ann:pw@127.0.0.1:5432/shop", nil, "/usr/bin").inspect
     # # => "#<PG::Testing::Server url: \"postgres://ann:[FILTERED]@127.0.0.1:5432/shop\", dir: nil>"
     # ```
     def inspect -> String
-      "#<PG::Testing::Server url: #{Server.masked(@url).inspect}, dir: #{@dir.inspect}>"
+      "#<PG::Testing::Server url: #{Server.masked(@url)}, dir: #{@dir.inspect}>"
     end
 
     # :nodoc:
-    # `url` with its password replaced by `[FILTERED]`, read as text: the
-    # user part's password (after the first `:` of what comes before the
-    # last `@` of the authority) and the value of a `password` parameter.
-    # (Not [PG.parse_url], which reads the environment for defaults: a
-    # value's text must not, so that `to_s` can run where the environment
-    # cannot, as a compile-time statement's argument.)
+    # `url` as [#inspect] shows it: quoted, its password replaced by
+    # `[FILTERED]`; `[FILTERED]` alone for a URL [PG.parse_url] refuses
+    # (a malformed one, an unknown parameter, a bad value: never shown in
+    # part). Read as [PG.parse_url] reads it (`read_url`,
+    # [PG::Config.url_parts]), not by [PG.parse_url] itself, which reads
+    # the environment for defaults: a value's text must
+    # not, so that `to_s` can run where the environment cannot, as a
+    # compile-time statement's argument.
     def self.masked(url: String) -> String
-      scheme, sep, rest = url.partition("://")
-      return url if sep.empty?
-      cut = rest.index(/[\/?]/) || rest.size
-      authority = rest[0, cut]
-      tail = rest[cut, rest.size - cut]
-      if (at = authority.rindex("@"))
-        user = authority[0, at]
-        if (colon = user.index(":"))
-          authority = "#{user[0, colon]}:[FILTERED]#{authority[at, authority.size - at]}"
-        end
+      parts = begin
+        # (Every check [PG.parse_url] makes: an unknown parameter, which
+        # may be a password, or a bad value refuses the URL too.)
+        read_url(url)
+        Config.url_parts(url)
+      rescue ArgumentError
+        return "[FILTERED]"
       end
-      tail = tail.gsub(/[?&]password=[^&]*/) { |m| "#{m.partition("=")[0]}=[FILTERED]" }
-      "#{scheme}://#{authority}#{tail}"
+      text = "#{parts.scheme}://"
+      if (name = parts.user_text)
+        text = text + name
+        text = text + ":[FILTERED]" if parts.password
+        text = text + "@"
+      end
+      text = text + parts.middle
+      if (pairs = parts.pairs)
+        shown = pairs.map { |p| p.name == "password" ? "#{p.raw.partition("=")[0]}=[FILTERED]" : p.raw }
+        text = "#{text}?#{shown.join("&")}"
+      end
+      text.inspect
     end
 
     def to_s -> String = inspect

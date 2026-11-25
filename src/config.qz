@@ -42,7 +42,9 @@ data Config(
   # `:gss`, `:sspi`. nil: SCRAM-SHA-256 always, and md5 and no
   # authentication only when the server is authenticated otherwise (a
   # unix socket, or TLS verified against roots) (pg#49).
-  require_auth: Array[Symbol]? = nil
+  require_auth: Array[Symbol]? = nil,
+  # The fewest SCRAM iterations the server may ask for ([PG::Scram]).
+  min_scram_iterations: Int = Scram::MIN_ITERATIONS
 )
   # The configuration as text, the password left out (a configuration is
   # logged, interpolated and printed).
@@ -89,8 +91,8 @@ end
 # (`postgresql://` too). The parts are percent-decoded; `host` may be a
 # socket directory (`%2Fvar%2Frun%2Fpostgresql`, or `?host=/var/run/...`);
 # the parameters `host`, `port`, `user`, `password`, `dbname`,
-# `application_name`, `connect_timeout` (seconds), `max_scram_iterations`,
-# `statement_cache_size`, `sslmode` (`disable`, `allow`, `prefer`, the
+# `application_name`, `connect_timeout` (seconds), `min_scram_iterations`,
+# `max_scram_iterations`, `statement_cache_size`, `sslmode` (`disable`, `allow`, `prefer`, the
 # default, `require`, `verify-ca` or `verify-full`: see [PG.connect]) and
 # `sslrootcert` (a PEM file's path, or `system`, which makes `sslmode`
 # `verify-full` unless given, and refuses a weaker one) and `options`
@@ -134,6 +136,7 @@ public def parse_url(url: String) -> Config
   database = (m[4] || "").empty? ? nil : Config.unescape(m[4] || "")
   application_name: String? = nil
   connect_timeout: Duration? = nil
+  min_scram_iterations = Scram::MIN_ITERATIONS
   max_scram_iterations = Scram::MAX_ITERATIONS
   statement_cache_size = Connection::STATEMENT_CACHE_SIZE
   sslmode: Symbol? = nil
@@ -155,6 +158,9 @@ public def parse_url(url: String) -> Config
     when "connect_timeout"
       raise ArgumentError.new("connect_timeout: not a number of seconds") unless value.match?(/\A[0-9]{1,9}\z/)
       connect_timeout = value.to_i == 0 ? nil : value.to_i.seconds
+    when "min_scram_iterations"
+      raise ArgumentError.new("min_scram_iterations: not a positive number") unless value.match?(/\A[1-9][0-9]{0,9}\z/)
+      min_scram_iterations = value.to_i
     when "max_scram_iterations"
       raise ArgumentError.new("max_scram_iterations: not a positive number") unless value.match?(/\A[1-9][0-9]{0,9}\z/)
       max_scram_iterations = value.to_i
@@ -190,7 +196,7 @@ public def parse_url(url: String) -> Config
              connect_timeout: connect_timeout, max_scram_iterations: max_scram_iterations,
              statement_cache_size: statement_cache_size,
              sslmode: Config.sslmode(sslmode, sslrootcert), sslrootcert: sslrootcert,
-             options: options, require_auth: require_auth)
+             options: options, require_auth: require_auth, min_scram_iterations: min_scram_iterations)
 end
 
 extension Config

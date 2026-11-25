@@ -67,6 +67,17 @@ class ScramTest < Test::Case
     assert_equal(CLIENT_FINAL, s.client_final(SERVER_FIRST))
   end
 
+  # pg#51: fewer rounds than RFC 7677's minimum are refused, unless the
+  # connection lowers min_scram_iterations.
+  def test_iteration_floor
+    assert_raise_message(/4095 iterations, fewer than the 4096 required \(lower the connection's min_scram_iterations/) do
+      scram.client_final("r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4095")
+    end
+    assert_raise(PG::AuthenticationError) { scram.client_final("r=rOprNGfwEbeRWgbNEkqOx,s=,i=1") }
+    s = PG::Scram.new("pencil", nonce: "rOprNGfwEbeRWgbNEkqO", user: "user", min_iterations: 1)
+    assert_match(/\Ac=biws,r=rOprNGfwEbeRWgbNEkqOx,p=/, s.client_final("r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1"))
+  end
+
   # Above BLOCKING_ITERATIONS the hashing runs on a helper thread: the same
   # bytes.
   def test_salted_password_on_a_helper_thread

@@ -327,6 +327,74 @@ class ConnectionFailureTest < Test::Case
     assert_equal(PG::Frontend.password("md59009ce60b9ca97f1e752376843d1309e"), password_sent(md5, secret))
   end
 
+  # pg#51: what a client does when a stand-in server over plain TCP starts
+  # SCRAM asking for `iterations` rounds, and sends its challenge again
+  # after the client's proof when `twice`: the error's class and message,
+  # or "sent" when the client answered and the stand-in then closed.
+  def scram_outcome(iterations: Int, twice: Bool = false, min_scram_iterations: Int = 4096) -> String
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.local_address.port
+    outcome = Task.scope do |scope|
+      got = scope.spawn do
+        peer = server.accept
+        size = peer.read_bytes(4)
+        peer.read_bytes(((size[0] << 24) | (size[1] << 16) | (size[2] << 8) | size[3]) - 4)
+        peer.write(PG::Wire.frame('R'.ord, b"\x00\x00\x00\x0aSCRAM-SHA-256\x00\x00"))
+        head = peer.read_bytes(5)
+        body = peer.read_bytes(((head[1] << 24) | (head[2] << 16) | (head[3] << 8) | head[4]) - 4)
+        # The client's first message ends with its nonce (r=...).
+        nonce = (body.decode? || "").split("r=").last? || ""
+        first = "r=#{nonce}srv,s=#{Base64.encode(b"salt")},i=#{iterations}"
+        challenge = b"\x00\x00\x00\x0b" + first.to_bytes
+        peer.write(PG::Wire.frame('R'.ord, challenge))
+        head = peer.read_bytes(5)
+        answered = !head.empty?
+        if answered && twice
+          peer.read_bytes(((head[1] << 24) | (head[2] << 16) | (head[3] << 8) | head[4]) - 4)
+          peer.write(PG::Wire.frame('R'.ord, challenge))
+          peer.read_bytes(1)
+        end
+        peer.close
+        answered
+      end
+      result = begin
+        PG.connect(host: "127.0.0.1", port: port, user: "ann", password: "pw", sslmode: :disable,
+                   min_scram_iterations:)
+        "connected"
+      rescue PG::ProtocolError => e
+        "ProtocolError: #{e.message}"
+      rescue PG::AuthenticationError => e
+        "AuthenticationError: #{e.message}"
+      rescue PG::ConnectionError
+        "sent"
+      end
+      answered = got.await
+      # Refused before the proof: no proof was sent to the stand-in.
+      assert_false(answered, "answered though refused") if result.start_with?("AuthenticationError")
+      result
+    end
+    server.close
+    outcome
+  end
+
+  def test_scram_iteration_floor
+    assert_equal("AuthenticationError: SCRAM: the server asks for 1 iterations, fewer than the 4096 required " +
+                 "(lower the connection's min_scram_iterations to accept it)", scram_outcome(1))
+    assert_equal("sent", scram_outcome(4096))
+    assert_equal("sent", scram_outcome(1, min_scram_iterations: 1))
+  end
+
+  def test_scram_challenge_twice
+    assert_equal("ProtocolError: unexpected AuthenticationSASLContinue after the client's proof", scram_outcome(4096, true))
+  end
+
+  def test_scram_iterations_in_url
+    assert_equal(4096, PG.parse_url("postgres://h/d").min_scram_iterations)
+    assert_equal(1000, PG.parse_url("postgres://h/d?min_scram_iterations=1000").min_scram_iterations)
+    assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?min_scram_iterations=0") }
+    assert_raise(ArgumentError) { PG.parse_url("postgres://h/d?min_scram_iterations=x") }
+  end
+
   def test_max_scram_iterations_in_url
     assert_equal(1_000_000, PG.parse_url("postgres://h/d").max_scram_iterations)
     assert_equal(5_000_000, PG.parse_url("postgres://h/d?max_scram_iterations=5000000").max_scram_iterations)

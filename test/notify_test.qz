@@ -151,6 +151,120 @@ class NotifyTest < Test::Case
     end
   end
 
+  # Exactly `n` bytes from `io`, or nil when it ends first.
+  def self.read_exact(io: IO, n: Int) -> Bytes?
+    out = Bytes::Builder.new
+    while out.size < n
+      part = io.read_bytes(n - out.size)
+      return nil if part.empty?
+      out << part
+    end
+    out.to_bytes
+  end
+
+  # Over TLS: the stand-in sends the first byte of a notification in a
+  # TLS record of its own, then the rest in a second record, of which a
+  # proxy forwards only the first 3 bytes: a message cut short inside a
+  # TLS record that never completes. The time left bounds the wait for
+  # the record's rest too (IO#wait_readable on a TLS socket answers for
+  # plaintext, not for the record's bytes).
+  def test_a_message_cut_inside_a_tls_record_closes_the_connection
+    cert = TLS::Testing.self_signed(["127.0.0.1"])
+    root = File.join(Dir.tmpdir, "pg-notify-#{Process.pid}-#{Random.rand(1_000_000_000)}.pem")
+    File.write(root, cert.certificate)
+    upstream = TCPServer.new("127.0.0.1", 0)
+    front = TCPServer.new("127.0.0.1", 0)
+    # Set once the client is connected: the proxy cuts the next record.
+    cut = Atom[Bool].new(false)
+    go = Channel[Nil].new(1)
+    release = Channel[Nil].new(1)
+    whole = notification("jobs", "tls")
+    begin
+      Task.scope do |scope|
+        server_task = scope.spawn do
+          raw = upstream.accept
+          NotifyTest.read_exact(raw, 8)
+          raw.write("S")
+          tls = TLSSocket.accept(raw, TLS::ServerConfig.new(certificate: cert.certificate, private_key: cert.private_key))
+          size = NotifyTest.read_exact(tls, 4) || b"\x00\x00\x00\x04"
+          NotifyTest.read_exact(tls, ((size[0] << 24) | (size[1] << 16) | (size[2] << 8) | size[3]) - 4)
+          tls.write(PG::Wire.frame('R'.ord, b"\x00\x00\x00\x00") + PG::Wire.frame('Z'.ord, b"I"))
+          go.receive?
+          tls.write(whole.slice(0, 1))
+          tls.write(whole.slice(1, whole.size - 1))
+          begin
+            Task.timeout(5.seconds) { release.receive? }
+          rescue Task::Timeout
+          end
+          raw.close
+        end
+        proxy_task = scope.spawn do
+          client = front.accept
+          server = TCPSocket.new("127.0.0.1", upstream.local_address.port)
+          Task.scope do |inner|
+            inner.spawn do
+              begin
+                loop do
+                  part = client.read_bytes(16_384)
+                  break if part.empty?
+                  server.write(part)
+                end
+              rescue IOError, SystemCallError
+                nil
+              end
+              nil
+            end
+            # Record by record from the server; once `cut` is set, the
+            # first application-data record goes whole and the second
+            # only in part.
+            seen = 0
+            begin
+              # (The answer to the SSLRequest, before TLS: one byte.)
+              client.write(NotifyTest.read_exact(server, 1) || b"")
+              loop do
+                head = NotifyTest.read_exact(server, 5) || break
+                body = NotifyTest.read_exact(server, (head[3] << 8) | head[4]) || break
+                if cut.get && head[0] == 23
+                  seen += 1
+                  if seen == 2
+                    client.write(head.slice(0, 3))
+                    next
+                  end
+                end
+                client.write(head + body)
+              end
+            rescue IOError, SystemCallError
+              nil
+            end
+            client.close
+            server.close
+          end
+        end
+        conn = PG.connect(host: "127.0.0.1", port: front.local_address.port, user: "ann", sslmode: :verify_full,
+                          sslrootcert: root, require_auth: "none")
+        begin
+          assert_true(conn.tls?)
+          cut.set(true)
+          go.send(nil)
+          started = Time.monotonic
+          e = assert_raise(PG::ConnectionError) { conn.wait_for_notify(timeout: 500.ms) }
+          assert_equal("a message from the server was not whole when the timeout passed: the connection is closed", e.message)
+          assert_true(Time.monotonic - started < 3.seconds)
+          assert_true(conn.closed?)
+        ensure
+          conn.close
+          release.try_send(nil)
+          server_task.await
+          proxy_task.await
+        end
+      end
+    ensure
+      upstream.close
+      front.close
+      File.delete(root) if File.exist?(root)
+    end
+  end
+
   def test_a_timeout_returns_nil_and_the_connection_goes_on
     pair do |listener, _|
       listener.listen("quiet")

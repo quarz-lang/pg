@@ -173,6 +173,28 @@ used any further; [PG::TransactionError] and [PG::NullError] are misuses.
   [PG::Connection#release] and `.adopt` move a single connection between
   tasks the same way.
 
+  A connection given back is only rolled back and stops listening
+  (below): what the work set in its session carries over to the next
+  user of the connection, namely settings (`SET`,
+  `set_config(..., false)`), `SET ROLE` and `SET SESSION AUTHORIZATION`,
+  temporary tables, session advisory locks, and statements prepared with
+  `PREPARE`. Set what belongs to one request (a tenant, a role for
+  row-level security) with `SET LOCAL`, or `set_config(..., true)`,
+  inside a transaction, which ends it at commit or rollback:
+
+```crystal
+pool.transaction do |c|
+  c.query("SELECT set_config('app.tenant', $1, true)", [tenant])
+  c.query("SELECT * FROM orders")
+end
+```
+
+  Work that wants a clean session may run `DISCARD ALL` itself in
+  `pool.with`, outside a transaction: the connection forgets its cached
+  statements when it sees that command's tag, so the next `query`
+  prepares them again. The pool does not do it at every checkin, which
+  would cost a round trip and empty the statement cache each time.
+
 ```crystal
 PG::Pool.open("postgres://app@localhost/shop", size: 8) do |pool|
   Task.scope do |s|

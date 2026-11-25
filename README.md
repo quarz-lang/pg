@@ -73,7 +73,23 @@ Work in progress. What exists:
   `bytes`, `time`, `date`, `decimal`, `json`, each with a `?` form for
   NULL; for arrays `ints`, `floats`, `strings`, `bools`, `times`,
   `dates`, `decimals`),
-  `command_tag`, `affected`.
+  `command_tag`, `affected`. A result is held in memory whole: the call
+  returns once the server has sent every row (a single message past
+  1 GB is refused). For a result that may be large, ask for fewer rows
+  (`LIMIT`, with a key to go on from), or read it in pieces through a
+  SQL cursor inside a transaction:
+
+  ```crystal
+  conn.transaction do |c|
+    c.exec("DECLARE big CURSOR FOR SELECT id, body FROM events")
+    loop do
+      rows = c.exec("FETCH 1000 FROM big").rows
+      break if rows.empty?
+      rows.each { |r| puts r.string("body") }
+    end
+  end
+  ```
+
 - Decimals (#40). `row.decimal(i)` reads a `numeric` column as a
   [Decimal], exactly and with its scale (`19.990` reads with scale 3;
   `row.float` still reads it as a [Float]), `decimals` a `numeric[]`; a
@@ -192,7 +208,9 @@ end
   Notifications that arrive while the connection runs queries are
   queued, in order: `wait_for_notify` takes those first, and
   `conn.notifications` takes them all without reading the socket. The
-  queue and the channels go with a [PG::Lease].
+  queue and the channels go with a [PG::Lease]. The queue has no bound:
+  a connection that listens must take its notifications, or they pile
+  up in memory for as long as it lives.
 
   The wait suspends only its task, and [Task.timeout] and `cancel`
   interrupt it. It waits for the socket to be readable before reading a

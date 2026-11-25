@@ -440,6 +440,9 @@ class Connection
   # leaves the connection usable when it was waiting between messages, as
   # it nearly always is; one interrupted in the middle of a message (the
   # rest of it not arrived yet) closes the connection, as [#exec] says.
+  # So does `timeout` passing in the middle of a message, which raises
+  # [PG::ConnectionError]: a server that sends part of a message and
+  # stalls does not hold the caller past `timeout`.
   # The server delivers notifications only between transactions: inside
   # one ([#transaction]), this waits for its timeout.
   # Raises [PG::ConnectionError] when the connection is closed or breaks,
@@ -461,12 +464,19 @@ class Connection
         broken(e.message)
       end
       return nil unless ready
-      # A whole message, or the connection closed: never out of step.
+      # A whole message, or the connection closed: never out of step. The
+      # message is read under what is left of the deadline (a server that
+      # sends part of one and stalls does not hold the caller past it);
+      # bytes already buffered are read without waiting, so a message
+      # whole in the buffer is never cut. (Only the reading: a notice
+      # handler it calls is not bounded.)
       done = false
       m = begin
-        r = receive_one
+        r = read_message(deadline) ||
+            raise ConnectionError.new("a message from the server was not whole when the timeout passed: " +
+                                      "the connection is closed")
         done = true
-        r
+        take(r)
       ensure
         unless done
           @closed = true
@@ -1055,17 +1065,27 @@ class Connection
   # The next message, or nil for one about the session itself: parameter
   # changes are recorded, notices go to the handler, and notifications to
   # the queue.
-  private def receive_one -> Backend?
-    m = begin
-      @reader.read
-    rescue ConnectionError => e
-      # The end of the stream, or bytes that are not the protocol.
-      @closed = true
-      close_io
-      raise e
-    rescue IOError, SystemCallError => e
-      broken(e.message)
-    end
+  private def receive_one -> Backend? = take(read_message(nil) || raise ConnectionError.new("the server closed the connection"))
+
+  # The next message as read, whatever it is about, or nil when
+  # `deadline` passes before it is whole ([PG::MessageReader#read_within]:
+  # the stream is then out of step). Raises [PG::ConnectionError] (and
+  # closes the connection) at the end of the stream, for bytes that are
+  # not the protocol, or when the socket fails.
+  private def read_message(deadline: Duration?) -> Backend?
+    @reader.read_within(deadline)
+  rescue ConnectionError => e
+    # The end of the stream, or bytes that are not the protocol.
+    @closed = true
+    close_io
+    raise e
+  rescue IOError, SystemCallError => e
+    broken(e.message)
+  end
+
+  # `m`, or nil for a message about the session itself, which it records
+  # (see `#receive_one`).
+  private def take(m: Backend) -> Backend?
     case m
     in Backend::ParameterStatus(name:, value:)
       @parameters = @parameters.put(name, value)

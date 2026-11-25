@@ -23,6 +23,19 @@
 # - A connection given back stops listening (`UNLISTEN *`, when
 #   [PG::Connection#listening?]), and the notifications it received are
 #   dropped: a listener uses a connection of its own ([PG.connect]).
+# - Nothing else is reset: what the work set in its session carries over
+#   to the next user of the connection: settings (`SET`,
+#   `set_config(..., false)`), `SET ROLE` and `SET SESSION
+#   AUTHORIZATION`, temporary tables, session advisory locks, and
+#   statements prepared with `PREPARE`. State that belongs to one piece
+#   of work (a tenant, a role for row-level security) is set with
+#   `SET LOCAL` (or `set_config(..., true)`) inside a transaction
+#   ([#transaction]), which ends it at commit or rollback. Work that
+#   wants a clean session may run `DISCARD ALL` itself in [#with],
+#   outside a transaction: the connection forgets its cached statements
+#   when it sees that command's tag. The pool does not do it at every
+#   checkin, which would cost a round trip and empty the statement cache
+#   each time.
 # - A connection idle for longer than `idle_timeout` (by default 5
 #   minutes; nil keeps them) is closed, so the pool shrinks after a
 #   burst. The pool has no task of its own: the stale connections are

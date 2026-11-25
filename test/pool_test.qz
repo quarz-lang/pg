@@ -53,6 +53,23 @@ class PoolTest < Test::Case
     end
   end
 
+  # What the README says: a session setting carries over to the next
+  # user, and a `DISCARD ALL` run in `with` clears it without leaving the
+  # statement cache naming statements the server dropped.
+  def test_discard_all_in_with_is_safe
+    PG::Pool.open(url, size: 1) do |pool|
+      pool.query("SELECT $1::int", [1])
+      pool.exec("SET application_name = 'pool_t_left'")
+      assert_equal("pool_t_left", pool.exec("SHOW application_name").rows[0].string(0))
+      pool.with { |c| c.exec("DISCARD ALL") }
+      assert_equal(0, pool.with { |c| c.prepared_statements })
+      assert_equal(2, pool.query("SELECT $1::int", [2]).rows[0].int(0))
+      assert_equal(1, pool.with { |c| c.exec("SELECT count(*) FROM pg_prepared_statements").rows[0].int(0) })
+      assert_false(pool.exec("SHOW application_name").rows[0].string(0) == "pool_t_left")
+      nil
+    end
+  end
+
   def test_ordinary_blocks_and_errors
     PG::Pool.open(url, size: 1) do |pool|
       seen: Array[Int] = []

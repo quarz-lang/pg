@@ -682,13 +682,17 @@ class Connection
   # A parameter's text, as the server reads it (nil for NULL). A Time is
   # sent in UTC, so that a `timestamp` column (without zone), which drops
   # the offset, keeps the instant as [PG::Row#time] reads it back. An
-  # [Array] is a one-dimensional PostgreSQL array (`encode_array`).
+  # [Array] is a one-dimensional PostgreSQL array (`encode_array`). A
+  # [String] holding a NUL, which PostgreSQL's text cannot hold, raises
+  # [ArgumentError] (the value not shown), an array's element too: before
+  # anything is sent, so the connection and its transaction go on (#68).
   #
   # ```
   # PG::Connection.encode(true)                # => b"t"
   # PG::Connection.encode(b"\x01\xff")       # => b"\\x01ff"
   # PG::Connection.encode(-Float::INFINITY)    # => b"-Infinity"
   # PG::Connection.encode([1, nil, 3])         # => b"{1,NULL,3}"
+  # PG::Connection.encode("a\0b")              # raises ArgumentError
   # ```
   def self.encode(value: Object?) -> Bytes?
     text = case value
@@ -704,7 +708,10 @@ class Connection
              else
                f.to_s
              end
-           in String => s then s
+           in String => s
+             # (Not quoted: it may be anything a request carried.)
+             raise ArgumentError.new("a String parameter holding a NUL, which PostgreSQL's text cannot hold") if s.include?("\0")
+             s
            in Symbol => s then s.to_s
            in Bytes => b then return "\\x#{b.hex}".to_bytes
            in Time => t then t.utc.iso8601(6)

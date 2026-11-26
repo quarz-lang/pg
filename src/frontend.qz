@@ -7,6 +7,9 @@ module Frontend
   # The code an SSLRequest sends in place of a protocol version.
   SSL_REQUEST = 80877103
 
+  # The code a CancelRequest sends in place of a protocol version.
+  CANCEL_REQUEST = 80877102
+
   # The SSLRequest: asks the server, before the startup message, whether
   # it speaks TLS; it answers one byte, `S` or `N`.
   #
@@ -14,6 +17,21 @@ module Frontend
   # PG::Frontend.ssl_request.hex   # => "0000000804d2162f"
   # ```
   def self.ssl_request -> Bytes = Wire.frame(nil, Wire.int32(Bytes::Builder.new, SSL_REQUEST).to_bytes)
+
+  # The CancelRequest, sent on a connection of its own (pg#14): asks the
+  # server to stop the statement the session `process_id` runs, proving
+  # it with that session's `secret` (BackendKeyData's key). The server
+  # answers nothing and closes the connection.
+  #
+  # ```
+  # PG::Frontend.cancel_request(7, b"\x01\x02\x03\x04").hex   # => "0000001004d2162e0000000701020304"
+  # ```
+  def self.cancel_request(process_id: Int, secret: Bytes) -> Bytes
+    b = Wire.int32(Bytes::Builder.new, CANCEL_REQUEST)
+    b = Wire.int32(b, process_id)
+    b << secret
+    Wire.frame(nil, b.to_bytes)
+  end
 
   # The startup message: the protocol version and the parameters
   # (`user` is required; `database`, `client_encoding`,

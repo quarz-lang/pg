@@ -1,0 +1,229 @@
+require "test"
+
+# A minimal stand-in for a server (pg#14): it takes a session's startup
+# with no authentication, gives the key `secret` for process 4242, and
+# never answers a query; on any other connection (a CancelRequest) it
+# reads what comes and, when `close_cancels` is false, never closes.
+# It records the bytes each cancel connection sent.
+data StandInPG(server: TCPServer, cancels: Atom[Array[Bytes]], close_cancels: Bool)
+  SECRET = b"\x0a\x0b\x0c\x0d"
+
+  def self.start(close_cancels: Bool) -> StandInPG
+    StandInPG.new(TCPServer.new("127.0.0.1", 0), Atom[Array[Bytes]].new([]), close_cancels)
+  end
+
+  def port -> Int = server.local_address.port
+
+  def url -> String = "postgres://u@127.0.0.1:#{port}/d?sslmode=disable&require_auth=none"
+
+  # Serves connections until the scope ends.
+  def serve(scope: Task::Scope) -> Void
+    me = self
+    scope.spawn do
+      loop do
+        sock = me.server.accept
+        scope.spawn { me.handle(sock) }
+      end
+      nil
+    end
+    nil
+  end
+
+  def handle(sock: TCPSocket) -> Void
+    head = sock.read_bytes(8)
+    return nil if head.size < 8
+    size = (head[0] << 24) | (head[1] << 16) | (head[2] << 8) | head[3]
+    code = (head[4] << 24) | (head[5] << 16) | (head[6] << 8) | head[7]
+    rest = size > 8 ? sock.read_bytes(size - 8) : Bytes.new
+    if code == 196608
+      # A session: AuthenticationOk, BackendKeyData, ReadyForQuery; then
+      # reads its queries and answers none.
+      sock.write(b"R\x00\x00\x00\x08\x00\x00\x00\x00")
+      sock.write(b"K\x00\x00\x00\x0c\x00\x00\x10\x92" + SECRET)
+      sock.write(b"Z\x00\x00\x00\x05I")
+      loop do
+        break if sock.read_bytes(1).empty?
+      end
+    else
+      cancels.update { |c| c + [head + rest] }
+      unless close_cancels
+        loop do
+          break if sock.read_bytes(1).empty?
+        end
+      end
+    end
+    sock.close
+    nil
+  rescue IOError, SystemCallError
+    nil
+  end
+end
+
+# CancelRequests (pg#14): a query cut short by a cancellation or a
+# Task.timeout asks the server to stop the statement.
+class CancelTest < Test::Case
+  SERVER = Atom[PG::Testing::Server | String].new("not started")
+  SSL = Atom[PG::Testing::Server | String].new("not started")
+
+  def self.startup
+    SERVER.set(PG::Testing.start_or_reason)
+    SSL.set(PG::Testing.start_or_reason(certificate: File.read("test/fixtures/tls/server.pem"),
+                                        private_key: File.read("test/fixtures/tls/server.key")))
+  end
+
+  def self.shutdown
+    [SERVER, SSL].each do |a|
+      case a.get
+      in PG::Testing::Server => s then s.stop
+      else nil
+      end
+    end
+  end
+
+  def url -> String
+    case SERVER.get
+    in PG::Testing::Server => s then s.url
+    in String => why then omit(why)
+    end
+  end
+
+  # The TLS cluster's URL, verified against the test CA (so no home roots
+  # come into it).
+  def ssl_url -> String
+    case SSL.get
+    in PG::Testing::Server => s
+      "#{s.url.sub("@127.0.0.1:", "@localhost:")}&sslmode=verify-full&sslrootcert=test/fixtures/tls/ca.pem"
+    in String => why then omit(why)
+    end
+  end
+
+  # Whether the backend `pid` stops running a statement (gone, or not
+  # active) within `within`, polled on `observer`.
+  def stops?(observer: PG::Connection, pid: Int, within: Duration = 5.seconds) -> Bool
+    deadline = Time.monotonic + within
+    loop do
+      rows = observer.query("SELECT state FROM pg_stat_activity WHERE pid = $1", [pid]).rows
+      return true if rows.empty? || rows[0].string(0) != "active"
+      return false if Time.monotonic > deadline
+      Task.sleep(50.ms)
+    end
+  end
+
+  def test_a_timeout_cancels_the_statement
+    observer = PG.connect(url)
+    c = PG.connect(url)
+    pid = c.process_id
+    started = Time.monotonic
+    assert_raise(Task::Timeout) { Task.timeout(300.ms) { c.exec("SELECT pg_sleep(30)") } }
+    took = Time.monotonic - started
+    STDERR.puts "cancel_test: a timeout of 300 ms with its cancel took #{took.to_ms} ms"
+    assert_true(took < 2.seconds, took.inspect)
+    assert_true(stops?(observer, pid))
+    assert_true(c.closed?)
+    observer.close
+  end
+
+  def test_a_cancelled_task_cancels_the_statement
+    observer = PG.connect(url)
+    pid = Atom.new(0)
+    u = url
+    t = Task.spawn do
+      c = PG.connect(u)
+      pid.set(c.process_id)
+      c.exec("SELECT pg_sleep(30)")
+      nil
+    end
+    deadline = Time.monotonic + 5.seconds
+    until pid.get != 0 && !stops?(observer, pid.get, 0.seconds)
+      flunk("the statement did not start") if Time.monotonic > deadline
+      Task.sleep(20.ms)
+    end
+    t.cancel
+    ended = begin
+              t.await
+              "returned"
+            rescue Task::Cancelled
+              "cancelled"
+            end
+    assert_equal("cancelled", ended)
+    assert_true(stops?(observer, pid.get))
+    observer.close
+  end
+
+  def test_a_pool_s_connection_cut_short
+    observer = PG.connect(url)
+    PG::Pool.open(url, size: 1) do |pool|
+      pid = pool.with { |c| c.process_id }
+      assert_raise(Task::Timeout) { Task.timeout(300.ms) { pool.with { |c| c.exec("SELECT pg_sleep(30)") } } }
+      assert_true(stops?(observer, pid))
+      # A new connection takes its place.
+      assert_equal("1", pool.with { |c| c.exec("SELECT 1").rows[0].string(0) })
+    end
+    observer.close
+  end
+
+  # No statement runs while waiting for a notification: no cancel, and
+  # the connection goes on.
+  def test_wait_for_notify_sends_none
+    c = PG.connect(url)
+    pid = c.process_id
+    c.listen("cancel_test")
+    assert_nil(c.wait_for_notify(timeout: 100.ms))
+    assert_equal("1", c.exec("SELECT 1").rows[0].string(0))
+    assert_equal(pid, c.process_id)
+    c.close
+  end
+
+  def test_over_tls
+    observer = PG.connect(url)
+    c = PG.connect(ssl_url)
+    assert_true(c.tls?)
+    pid = c.process_id
+    assert_raise(Task::Timeout) { Task.timeout(300.ms) { c.exec("SELECT pg_sleep(30)") } }
+    assert_true(stops?(PG.connect(ssl_url), pid))
+    observer.close
+  end
+
+  # A server that takes the cancel and never closes: the interrupted call
+  # still returns, within its timeout plus CANCEL_TIMEOUT; the error is
+  # its own, without the key.
+  def test_a_server_that_does_not_close
+    fake = StandInPG.start(false)
+    Task.scope do |s|
+      fake.serve(s)
+      c = PG.connect(fake.url)
+      started = Time.monotonic
+      e = assert_raise(Task::Timeout) { Task.timeout(200.ms) { c.exec("SELECT 1") } }
+      took = Time.monotonic - started
+      assert_true(took >= PG::Connection::CANCEL_TIMEOUT && took < PG::Connection::CANCEL_TIMEOUT + 3.seconds, took.inspect)
+      sent = fake.cancels.get
+      assert_equal([PG::Frontend.cancel_request(4242, StandInPG::SECRET)], sent)
+      refute(e.message.include?("0a0b0c0d") || e.message.include?(StandInPG::SECRET.inspect), e.message)
+      refute(c.inspect.include?(StandInPG::SECRET.inspect), c.inspect)
+      fake.server.close
+      s.cancel
+    end
+  end
+
+  # The cancel of a TLS session never goes in clear: a server answering
+  # `N` to its SSLRequest gets the SSLRequest only.
+  def test_no_cancel_in_clear_for_a_tls_session
+    fake = StandInPG.start(true)
+    Task.scope do |s|
+      fake.serve(s)
+      route = PG::CancelRoute.new(Socket::Address.new("127.0.0.1", fake.port), TLS::Config.new)
+      config = PG.parse_url(fake.url, env: Hash[String, String].new)
+      # (The stand-in reads the 8-byte SSLRequest as a request and closes.)
+      PG::Connection.send_cancel(config, route, PG::Frontend.cancel_request(4242, StandInPG::SECRET))
+      assert_equal([PG::Frontend.ssl_request], fake.cancels.get)
+      fake.server.close
+      s.cancel
+    end
+  end
+
+  def test_cancel_request_encoding
+    assert_equal("0000001004d2162e0000000701020304", PG::Frontend.cancel_request(7, b"\x01\x02\x03\x04").hex)
+    # A protocol 3.2 key, longer than 4 bytes.
+    assert_equal(12 + 32, PG::Frontend.cancel_request(7, ("k" * 32).to_bytes).size)
+  end
+end

@@ -376,12 +376,27 @@ class PoolTest < Test::Case
     end
   end
 
-  # Opens `n` connections at once (each held a moment).
-  def burst(pool: PG::Pool, n: Int) -> Void
+  # Opens `n` connections at once (each held a moment). Returns the
+  # earliest time ([Time.monotonic]) a task's work ended, which is before
+  # its connection was given back: a connection the pool closed as idle
+  # during the burst was given back `idle_timeout` before the burst
+  # ended, so none was when the burst took less than that since then.
+  def burst(pool: PG::Pool, n: Int) -> Duration
+    ends = Atom[Array[Duration]].new([])
     Task.scope do |s|
-      n.times { s.spawn { pool.with { |_| Task.sleep(20.ms) } } }
+      n.times do
+        s.spawn do
+          pool.with do |_|
+            Task.sleep(20.ms)
+            done = Time.monotonic
+            ends.update { |xs| xs.push(done) }
+          end
+          nil
+        end
+      end
     end
-    nil
+    xs = ends.get
+    xs.empty? ? Time.monotonic : xs.reduce(xs[0]) { |a, b| b < a ? b : a }
   end
 
   # Connections idle past the timeout are closed when the pool is next
@@ -393,8 +408,15 @@ class PoolTest < Test::Case
         c.notify("pool_idle", "x")
         c.exec("SELECT 1")
       end
-      burst(pool, 3)
-      assert_equal(3, pool.size)
+      # (Three, unless the burst itself took the idle timeout: then the
+      # pool rightly closed the first given back. Measured, not assumed:
+      # a slow run, a debug `quarz` on a busy machine, gets there (#47).)
+      given_back = burst(pool, 3)
+      if Time.monotonic - given_back < 50.ms
+        assert_equal(3, pool.size)
+      else
+        notify("the burst took the idle timeout: the size of 3 is not checked")
+      end
       Task.sleep(80.ms)
       # The three are stale: closed, and a new one serves the query.
       assert_equal(1, pool.exec("SELECT 1").rows[0].int(0))
@@ -420,11 +442,23 @@ class PoolTest < Test::Case
     PG::Pool.open(url, size: 3, idle_timeout: 100.ms) do |pool: PG::Pool|
       burst(pool, 3)
       pids: Array[Int] = []
+      # (The longest a connection stayed idle between two uses: one past
+      # the idle timeout was rightly closed, the next use opening another.
+      # Measured, not assumed, as in test_idle_connections_are_closed.)
+      longest = 0.seconds
+      last = Time.monotonic
       10.times do
+        idle = Time.monotonic - last
+        longest = idle if idle > longest
         pids = pids.push(pool.with { |c| c.process_id })
+        last = Time.monotonic
         Task.sleep(30.ms)
       end
-      assert_equal(1, pids.uniq.size)
+      if longest < 100.ms
+        assert_equal(1, pids.uniq.size)
+      else
+        notify("a use came the idle timeout after the last: one connection is not checked")
+      end
       assert_equal(1, pool.size)
       nil
     end

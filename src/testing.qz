@@ -7,6 +7,16 @@
 # password comes from the default random generator, which a test's
 # `srand` makes predictable.
 #
+# A cluster's URL spells its host, port, user, password and database and
+# `?sslmode=prefer` (append parameters with `&`; a later `sslmode` wins),
+# so libpq's variables in the developer's environment do not change them
+# (pg#71). `PGSSLROOTCERT`, `PGOPTIONS`, `PGAPPNAME` and
+# `PGCONNECT_TIMEOUT` still reach a test, as for any URL that omits them:
+# `PGSSLROOTCERT=system` makes `PG.connect` refuse the URL
+# ([ArgumentError]: the system's roots need `verify-full`), and a path
+# has the server verified against it when the session goes over TLS.
+# PG_TEST_URL's URL is the user's and is left as given.
+#
 # ```quarz no_run
 # PG::Testing.with_cluster do |url|
 #   conn = PG.connect(url)
@@ -119,12 +129,17 @@ module Testing
     # The password in the URL.
     def password -> String
       # (A URL's password is a String.)
-      p = cog.parse_url(@url).password
+      # (Not from the environment: the server's own URL, read as written.)
+      config, _ = read_url(@url)
+      p = config.password
       p.is_a?(String) ? p : ""
     end
 
     # The port in the URL.
-    def port -> Int = cog.parse_url(@url).port
+    def port -> Int
+      config, _ = read_url(@url)
+      config.port
+    end
 
     # Stops a cluster of ours and removes its directory; nothing for
     # PG_TEST_URL's.
@@ -180,7 +195,7 @@ module Testing
         ssl = "ssl = on\nssl_cert_file = '#{quote(dir)}/server.crt'\nssl_key_file = '#{quote(dir)}/server.key'\n"
       end
       port = start_on_a_free_port(bin, dir, ssl)
-      Server.new("postgres://quarz:#{password}@127.0.0.1:#{port}/postgres", dir, bin)
+      Server.new("postgres://quarz:#{password}@127.0.0.1:#{port}/postgres?sslmode=prefer", dir, bin)
     rescue Exception => e
       # (A start that timed out may have left the server running.)
       if File.exist?("#{dir}/data/postmaster.pid")

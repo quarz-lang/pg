@@ -84,6 +84,36 @@ data Config(
     return picked.uniq if negated == 0
     methods.values.reject { |m| picked.include?(m) }
   end
+
+  # :nodoc:
+  # The configuration [PG.connect]'s keywords give: each nil keyword from
+  # `env`, else its default (pg#71).
+  def self.from_keywords(*, host: String? = nil, port: Int? = nil, user: String? = nil,
+                         password: (String | Bytes::Secret)? = nil, database: String? = nil, application_name: String? = nil,
+                         allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
+                         min_scram_iterations: Int = Scram::MIN_ITERATIONS,
+                         max_scram_iterations: Int = Scram::MAX_ITERATIONS,
+                         statement_cache_size: Int = Connection::STATEMENT_CACHE_SIZE,
+                         sslmode: Symbol? = nil, sslrootcert: String? = nil, options: String? = nil,
+                         require_auth: String? = nil, env: Hash[String, String] = ENV) -> Config
+    if statement_cache_size < 0 || statement_cache_size > 999_999
+      raise ArgumentError.new("statement_cache_size: #{statement_cache_size}")
+    end
+    if (mode = sslmode)
+      raise ArgumentError.new("sslmode: #{mode.inspect}") unless Config.sslmode?(mode)
+    end
+    raise ArgumentError.new("sslrootcert: empty") if sslrootcert == ""
+    config = Config.new(host: host || "localhost", port: port || 5432, user: user || "", password:, database:,
+                        application_name:, allow_cleartext:, connect_timeout:, max_scram_iterations:,
+                        statement_cache_size:, sslmode: Config.sslmode(sslmode, sslrootcert),
+                        sslrootcert:, options:, require_auth: (t = require_auth) ? Config.require_auth(t) : nil,
+                        min_scram_iterations:)
+    given = [["host", host.nil?], ["port", port.nil?], ["user", user.nil?], ["password", password.nil?],
+             ["database", database.nil?], ["application_name", application_name.nil?],
+             ["connect_timeout", connect_timeout.nil?], ["sslmode", sslmode.nil?], ["sslrootcert", sslrootcert.nil?],
+             ["options", options.nil?]].reject { |pair| pair[1] }.map { |pair| pair[0] }
+    Config.with_env(config, given, env)
+  end
 end
 
 # :nodoc:
@@ -122,6 +152,20 @@ data UrlPair = (raw: String, name: String, value: String)
 # host or port, a parameter) and never quote the URL or a value in it,
 # which may hold a password.
 #
+# What the URL does not give comes from libpq's environment variables,
+# as in libpq (pg#71): `PGHOST`, `PGPORT`, `PGUSER` (then `USER`, then
+# `postgres`), `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`,
+# `PGCONNECT_TIMEOUT`, `PGSSLMODE`, `PGSSLROOTCERT` and `PGOPTIONS`, read
+# from `env` (the process's environment by default; `env: {}` reads
+# none). A value the URL gives, empty included (`?options=`), is never
+# taken from the environment; a variable set but empty is not set. A
+# malformed variable raises [ArgumentError] naming it, never quoting its
+# value; `PGHOST` and `PGPORT` with several hosts or ports (`a,b`) are
+# refused. `PGPASSWORD` is the password of whatever user connects, and
+# `PGSSLMODE` may weaken TLS below the default `prefer` (`disable`): a
+# URL that must not depend on the environment spells these out.
+# `PGPASSFILE` (`~/.pgpass`) and `PGSERVICE` are not read.
+#
 # ```
 # c = PG.parse_url("postgres://ann:s%40cret@db.example:6543/shop?application_name=web")
 # [c.host, c.port, c.user, c.password, c.database, c.application_name]
@@ -133,16 +177,17 @@ data UrlPair = (raw: String, name: String, value: String)
 # PG.parse_url("postgres://h/d?sslrootcert=system&sslmode=require")  # raises ArgumentError
 # PG.parse_url("postgres://h/d?sslcert=client.pem")  # raises ArgumentError
 # ```
-public def parse_url(url: String) -> Config
-  config, user_given = read_url(url)
-  user_given ? config : config.with(user: Config.default_user)
+public def parse_url(url: String, *, env: Hash[String, String] = ENV) -> Config
+  config, given = read_url(url)
+  Config.with_env(config, given, env)
 end
 
 # What [PG.parse_url] reads, with the same errors, without the
 # environment: the configuration, its user empty when the URL names none,
-# and whether it names one. (A value's text may be made at compile time,
-# where the environment cannot be read: [PG::Testing::Server#inspect].)
-def read_url(url: String) -> [Config, Bool]
+# and the names of the values the URL gives ([Config.with_env]'s). (A
+# value's text may be made at compile time, where the environment cannot
+# be read: [PG::Testing::Server#inspect].)
+def read_url(url: String) -> [Config, Array[String]]
   parts = Config.url_parts(url)
   user = parts.user
   password = parts.password
@@ -158,10 +203,18 @@ def read_url(url: String) -> [Config, Bool]
   sslrootcert: String? = nil
   options: String? = nil
   require_auth: Array[Symbol]? = nil
+  given: Array[String] = []
+  given = given.push("host") unless host.empty?
+  given = given.push("port") unless parts.port.empty?
+  given = given.push("user") unless user.nil?
+  given = given.push("password") unless password.nil?
+  given = given.push("database") unless parts.database.empty?
   (parts.pairs || Array[UrlPair].new).each do |pair|
     next if pair.raw.empty?
     name = pair.name
     value = pair.value
+    mapped = name == "dbname" ? "database" : name
+    given = given.push(mapped) if Config.env_variables.key?(mapped) && !given.include?(mapped)
     case name
     when "host" then host = value
     when "port" then port = Config.port(value)
@@ -169,9 +222,7 @@ def read_url(url: String) -> [Config, Bool]
     when "password" then password = value
     when "dbname" then database = value
     when "application_name" then application_name = value
-    when "connect_timeout"
-      raise ArgumentError.new("connect_timeout: not a number of seconds") unless value.match?(/\A[0-9]{1,9}\z/)
-      connect_timeout = value.to_i == 0 ? nil : value.to_i.seconds
+    when "connect_timeout" then connect_timeout = Config.connect_timeout(value)
     when "min_scram_iterations"
       raise ArgumentError.new("min_scram_iterations: not a positive number") unless value.match?(/\A[1-9][0-9]{0,9}\z/)
       min_scram_iterations = value.to_i
@@ -211,13 +262,87 @@ def read_url(url: String) -> [Config, Bool]
                       statement_cache_size: statement_cache_size,
                       sslmode: Config.sslmode(sslmode, sslrootcert), sslrootcert: sslrootcert,
                       options: options, require_auth: require_auth, min_scram_iterations: min_scram_iterations)
-  [config, !user.nil?]
+  [config, given]
 end
 
 extension Config
   # The user's name from the environment (PGUSER, then USER), as
   # libpq takes it when a URL names none.
-  def self.default_user -> String = ENV["PGUSER"]? || ENV["USER"]? || "postgres"
+  def self.default_user -> String = Config.default_user(ENV)
+
+  # The user's name from `env` (PGUSER, then USER, each when set and not
+  # empty), else `postgres`.
+  def self.default_user(env: Hash[String, String]) -> String
+    Config.env_value(env, "PGUSER") || Config.env_value(env, "USER") || "postgres"
+  end
+
+  # :nodoc:
+  # The values libpq's environment variables give, by the name
+  # [Config.with_env] knows them by (pg#71).
+  def self.env_variables -> Hash[String, String]
+    {"host" => "PGHOST", "port" => "PGPORT", "user" => "PGUSER", "password" => "PGPASSWORD",
+                   "database" => "PGDATABASE", "application_name" => "PGAPPNAME",
+                   "connect_timeout" => "PGCONNECT_TIMEOUT", "sslmode" => "PGSSLMODE",
+                   "sslrootcert" => "PGSSLROOTCERT", "options" => "PGOPTIONS"}
+  end
+
+  # :nodoc:
+  # The variable `name` of `env`: nil when unset or empty, as libpq.
+  # Raises [ArgumentError] naming it (never its value: `PGPASSWORD`) when
+  # it holds a NUL character, which no startup message can carry.
+  def self.env_value(env: Hash[String, String], name: String) -> String?
+    v = env[name]?
+    return nil if v.nil? || v.empty?
+    raise ArgumentError.new("#{name}: holds a NUL character") if v.include?("\x00")
+    v
+  end
+
+  # :nodoc:
+  # `config` with, for each value `given` does not name (a name of
+  # [Config.env_variables]), the one its libpq variable in `env` gives (as
+  # [PG.parse_url] says), each variable checked as the URL's parameter
+  # of the same meaning; then the user from `USER` or `postgres`, and
+  # the `sslmode` that follows from the mode given (by the URL or the
+  # keywords, else `PGSSLMODE`) and the root certificates. The one place
+  # the environment is read for a connection (pg#71).
+  def self.with_env(config: Config, given: Array[String], env: Hash[String, String]) -> Config
+    c = config
+    ungiven = ->(name: String) { given.include?(name) ? nil : Config.env_value(env, Config.env_variables[name]) }
+    if (h = ungiven.call("host"))
+      raise ArgumentError.new("PGHOST: several hosts are not supported") if h.include?(",")
+      c = c.with(host: h)
+    end
+    if (p = ungiven.call("port"))
+      raise ArgumentError.new("PGPORT: several ports are not supported") if p.include?(",")
+      c = c.with(port: Config.port(p, what: "PGPORT"))
+    end
+    c = c.with(user: Config.default_user(env)) unless given.include?("user")
+    if (pw = ungiven.call("password"))
+      c = c.with(password: pw)
+    end
+    if (d = ungiven.call("database"))
+      c = c.with(database: d)
+    end
+    if (a = ungiven.call("application_name"))
+      c = c.with(application_name: a)
+    end
+    if (t = ungiven.call("connect_timeout"))
+      c = c.with(connect_timeout: Config.connect_timeout(t, what: "PGCONNECT_TIMEOUT"))
+    end
+    if (r = ungiven.call("sslrootcert"))
+      c = c.with(sslrootcert: r)
+    end
+    if (o = ungiven.call("options"))
+      c = c.with(options: o)
+    end
+    mode: Symbol? = nil
+    if given.include?("sslmode")
+      mode = c.sslmode
+    elsif (m = ungiven.call("sslmode"))
+      mode = Config.sslmode(m, what: "PGSSLMODE")
+    end
+    c.with(sslmode: Config.sslmode(mode, c.sslrootcert))
+  end
 
   # Why `url` is not a connection URL, without quoting any of it (its
   # user information may be a password that holds a `/`, `?`, `#` or
@@ -298,9 +423,9 @@ extension Config
 
   # The `sslmode` a URL spells (`verify-full`), as a Symbol
   # (`:verify_full`). Raises [ArgumentError] for another value.
-  def self.sslmode(text: String) -> Symbol
+  def self.sslmode(text: String, *, what: String = "sslmode") -> Symbol
     mode = text.tr("-", "_").to_sym
-    raise ArgumentError.new("sslmode: not one of disable, allow, prefer, require, verify-ca, verify-full") unless sslmode?(mode) && !text.include?("_")
+    raise ArgumentError.new("#{what}: not one of disable, allow, prefer, require, verify-ca, verify-full") unless sslmode?(mode) && !text.include?("_")
     mode
   end
 
@@ -322,9 +447,16 @@ extension Config
     [:disable, :allow, :prefer, :require, :verify_ca, :verify_full].include?(mode)
   end
 
-  # A port number, 1 to 65535.
-  def self.port(text: String) -> Int
-    raise ArgumentError.new("port: not a number from 1 to 65535") unless text.match?(/\A[0-9]{1,5}\z/) && (1..65535).include?(text.to_i)
+  # A connect timeout in whole seconds, 0 meaning none (nil), as libpq's
+  # (`what` names it in the error).
+  def self.connect_timeout(text: String, *, what: String = "connect_timeout") -> Duration?
+    raise ArgumentError.new("#{what}: not a number of seconds") unless text.match?(/\A[0-9]{1,9}\z/)
+    text.to_i == 0 ? nil : text.to_i.seconds
+  end
+
+  # A port number, 1 to 65535 (`what` names it in the error).
+  def self.port(text: String, *, what: String = "port") -> Int
+    raise ArgumentError.new("#{what}: not a number from 1 to 65535") unless text.match?(/\A[0-9]{1,5}\z/) && (1..65535).include?(text.to_i)
     text.to_i
   end
 end

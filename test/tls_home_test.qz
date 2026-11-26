@@ -10,14 +10,14 @@ class TlsHomeTest < Test::Case
     case ENV["PG_TLS_HOME_EXPECT"]?
     when "verified"
       # require, verified against root.crt.
-      c = PG.connect("#{url}?sslmode=require")
+      c = PG.connect("#{url}&sslmode=require")
       assert_true(c.tls?)
       c.close
     when "refused"
       # A root.crt of another CA: require fails.
-      assert_raise_message(/certificate verify failed/) { PG.connect("#{url}?sslmode=require") }
+      assert_raise_message(/certificate verify failed/) { PG.connect("#{url}&sslmode=require") }
       # verify-full too.
-      assert_raise_message(/certificate verify failed/) { PG.connect("#{url}?sslmode=verify-full") }
+      assert_raise_message(/certificate verify failed/) { PG.connect("#{url}&sslmode=verify-full") }
     when "junk"
       # A root.crt that holds no certificate: read only when the server
       # agrees to TLS, so nothing listening is the error...
@@ -40,7 +40,7 @@ class TlsHomeTest < Test::Case
       end
       server.close
       # ...and against a TLS server, a ConnectionError naming it.
-      assert_raise_message(/the roots in .*\.postgresql\/root\.crt/) { PG.connect("#{url}?sslmode=require") }
+      assert_raise_message(/the roots in .*\.postgresql\/root\.crt/) { PG.connect("#{url}&sslmode=require") }
     else
       flunk("PG_TLS_HOME_EXPECT: verified, refused or junk")
     end

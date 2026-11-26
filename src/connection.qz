@@ -3,12 +3,20 @@
 # password, a missing database), [PG::AuthenticationError] when this
 # client cannot authenticate as the server asks, and [PG::ConnectionError]
 # when the server cannot be reached or does not answer in time.
-public def connect(url: String) -> Connection = Connection.open(parse_url(url))
+# What the URL does not give comes from `env`, libpq's variables
+# ([PG.parse_url]; `env: {}` reads none).
+public def connect(url: String, *, env: Hash[String, String] = ENV) -> Connection = Connection.open(parse_url(url, env:))
 
 # Connects as `PG.connect(url)` does, from keywords: `host` is a host name
 # or address, or a directory holding the server's unix socket (a path
 # starting with `/`). A password is sent in clear only over a unix socket,
 # or when `allow_cleartext` says so. `min_scram_iterations` and
+# A keyword not given (nil) takes its value from libpq's environment
+# variables, as a URL's missing parts do ([PG.parse_url] lists them; `env`
+# is the environment, `env: {}` reads none), else its default: `host`
+# `"localhost"`, `port` 5432, `user` `USER`'s name or `postgres`, no
+# password, the user's database, no connect timeout, `sslmode` `:prefer`
+# (pg#71). `min_scram_iterations` and
 # `max_scram_iterations` are the fewest and the most SCRAM iterations the
 # server may ask for (4096 and 1,000,000 by default; [PG::Scram]),
 # `statement_cache_size` how many
@@ -58,27 +66,19 @@ public def connect(url: String) -> Connection = Connection.open(parse_url(url))
 # queries). A server still on md5 (`password_encryption = md5`) or
 # `trust` over plain TCP needs `require_auth: "md5"` or `"none"` (pg#49).
 # A password in clear also needs `allow_cleartext` over TCP.
-public def connect(*, host: String = "localhost", port: Int = 5432, user: String = Config.default_user,
+public def connect(*, host: String? = nil, port: Int? = nil, user: String? = nil,
                    password: (String | Bytes::Secret)? = nil, database: String? = nil, application_name: String? = nil,
                    allow_cleartext: Bool = false, connect_timeout: Duration? = nil,
                    min_scram_iterations: Int = Scram::MIN_ITERATIONS,
                    max_scram_iterations: Int = Scram::MAX_ITERATIONS,
                    statement_cache_size: Int = Connection::STATEMENT_CACHE_SIZE,
                    sslmode: Symbol? = nil, sslrootcert: String? = nil, options: String? = nil,
-                   require_auth: String? = nil) -> Connection
-  if statement_cache_size < 0 || statement_cache_size > 999_999
-    raise ArgumentError.new("statement_cache_size: #{statement_cache_size}")
-  end
-  if (mode = sslmode)
-    raise ArgumentError.new("sslmode: #{mode.inspect}") unless Config.sslmode?(mode)
-  end
-  raise ArgumentError.new("sslrootcert: empty") if sslrootcert == ""
-  Connection.open(Config.new(host:, port:, user:, password:, database:, application_name:,
-                             allow_cleartext:, connect_timeout:, max_scram_iterations:,
-                             statement_cache_size:, sslmode: Config.sslmode(sslmode, sslrootcert),
-                             sslrootcert:, options:, require_auth: (t = require_auth) ? Config.require_auth(t) : nil,
-                             min_scram_iterations:))
+                   require_auth: String? = nil, env: Hash[String, String] = ENV) -> Connection
+  Connection.open(Config.from_keywords(host:, port:, user:, password:, database:, application_name:, allow_cleartext:, connect_timeout:,
+                                       min_scram_iterations:, max_scram_iterations:, statement_cache_size:, sslmode:, sslrootcert:,
+                                       options:, require_auth:, env:))
 end
+
 
 # Raises `ArgumentError` for a channel name the server cannot take as
 # given: empty, holding a NUL, or of 64 bytes or more (an identifier

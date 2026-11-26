@@ -59,7 +59,7 @@ class TlsTest < Test::Case
   # The SSL server's URL with `params`, its host spelled `host`.
   def ssl_url(params: String, host: String = "127.0.0.1") -> String
     no_home_roots unless params.include?("sslrootcert=") || params.include?("sslmode=disable")
-    "#{server(SSL).url.sub("@127.0.0.1:", "@#{host}:")}?#{params}"
+    "#{server(SSL).url.sub("@127.0.0.1:", "@#{host}:")}&#{params}"
   end
 
   # PG_TEST_URL's server may have TLS on (a packaged PostgreSQL's
@@ -192,7 +192,7 @@ class TlsTest < Test::Case
 
   def test_allow
     no_home_roots
-    c = PG.connect("#{server(HOSTSSL).url}?sslmode=allow")
+    c = PG.connect("#{server(HOSTSSL).url}&sslmode=allow")
     assert_true(c.tls?)
     c.close
     c = PG.connect(plain_url("sslmode=allow"))
@@ -205,7 +205,7 @@ class TlsTest < Test::Case
   end
 
   def test_hostssl_refuses_plain
-    e = assert_raise(PG::ServerError) { PG.connect("#{server(HOSTSSL).url}?sslmode=disable") }.as(PG::ServerError)
+    e = assert_raise(PG::ServerError) { PG.connect("#{server(HOSTSSL).url}&sslmode=disable") }.as(PG::ServerError)
     assert_equal("28000", e.code)
   end
 

@@ -68,10 +68,12 @@ class Pool
 
   # A pool of up to [size] connections to the server `url` names (see
   # [PG.connect]); close it with [#close]. [.open] closes it for you.
+  # What the URL does not give comes from `env`, libpq's variables
+  # ([PG.parse_url]; `env: {}` reads none).
   def initialize(url: String, @size: Int = 10, @checkout_timeout: Duration? = nil,
-                 @idle_timeout: Duration? = 5.minutes)
+                 @idle_timeout: Duration? = 5.minutes, env: Hash[String, String] = ENV)
     Pool.check(size, idle_timeout)
-    @config = parse_url(url)
+    @config = parse_url(url, env:)
     @idle = Atom[Array[Idle]].new([])
     @freed = Channel[Nil].new(size)
     @opened = Atom[Int].new(0)
@@ -98,8 +100,8 @@ class Pool
   # Runs the block with a new pool (see [.new]), and closes the pool when
   # the block ends. Returns the block's value.
   def self.open[R](url: String, size: Int = 10, checkout_timeout: Duration? = nil,
-                   idle_timeout: Duration? = 5.minutes, &: (Pool) -> R) -> R
-    pool = Pool.new(url, size:, checkout_timeout:, idle_timeout:)
+                   idle_timeout: Duration? = 5.minutes, env: Hash[String, String] = ENV, &: (Pool) -> R) -> R
+    pool = Pool.new(url, size:, checkout_timeout:, idle_timeout:, env:)
     begin
       yield pool
     ensure

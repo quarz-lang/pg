@@ -39,6 +39,34 @@ Work in progress. What exists:
   `extra_float_digits`, `application_name`) keep pg's values: the server
   takes the startup message's own parameters over `options`.
 
+- libpq's environment variables (pg#71): what the URL or the keywords
+  do not give comes from the environment, as in libpq. The variables
+  read are `PGHOST`, `PGPORT`, `PGUSER` (then `USER`), `PGPASSWORD`,
+  `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, `PGSSLMODE`,
+  `PGSSLROOTCERT` and `PGOPTIONS`. A value the URL or a keyword gives
+  (an empty URL parameter included) is never replaced, and a variable
+  set but empty counts as unset. A malformed variable is an
+  `ArgumentError` naming it, never quoting its value; several hosts or
+  ports (`a,b`) are refused. `PGPASSFILE` (`~/.pgpass`) and `PGSERVICE`
+  are not read.
+
+  So a program that inherits stray variables gets them for whatever
+  its URL omits. Four of them matter for security:
+
+  - `PGSSLMODE=disable` turns TLS off where the URL says nothing
+    (the default is otherwise `prefer`, or `verify-full` with
+    `sslrootcert=system`).
+  - `PGOPTIONS` sets session settings.
+  - `PGSSLROOTCERT` changes the roots the server is verified against.
+  - `PGPASSWORD` is sent to whatever server asks for a password, as the
+    password of whichever user connects.
+
+  A URL that must not depend on the environment spells these out. To
+  read no environment at all, pass `env: {}` to `PG.parse_url`,
+  `PG.connect`, `PG::Pool.new` or `PG::Pool.open` (each defaults to
+  the process's `ENV`); `PG::Pool.new(config)` reads nothing beyond
+  its [PG::Config]. [PG::Testing]'s URLs spell `sslmode` (see there).
+
 - TLS over TCP, through Quarz's [TLSSocket] (rustls), as `sslmode`
   (keyword or URL parameter) says; `conn.tls?` tells.
 

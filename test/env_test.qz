@@ -1,0 +1,149 @@
+require "test"
+
+# libpq's environment variables as defaults (pg#71): what the URL or the
+# keywords do not give, read from `env:`; never over a given value.
+class EnvTest < Test::Case
+  FULL = {"PGHOST" => "envhost", "PGPORT" => "6000", "PGUSER" => "envuser", "PGPASSWORD" => "env-pw-9",
+          "PGDATABASE" => "envdb", "PGAPPNAME" => "envapp", "PGCONNECT_TIMEOUT" => "7",
+          "PGSSLMODE" => "require", "PGSSLROOTCERT" => "/env/ca.pem", "PGOPTIONS" => "-c search_path=env"}
+
+  def fields(c: PG::Config) -> Array[String]
+    [c.host, c.port.to_s, c.user, c.password.inspect, c.database.inspect, c.application_name.inspect,
+     c.connect_timeout.inspect, c.sslmode.inspect, c.sslrootcert.inspect, c.options.inspect]
+  end
+
+  def test_each_variable_is_a_default
+    c = PG.parse_url("postgres://", env: FULL)
+    assert_equal(["envhost", "6000", "envuser", "\"env-pw-9\"", "\"envdb\"", "\"envapp\"", 7.seconds.inspect,
+                  ":require", "\"/env/ca.pem\"", "\"-c search_path=env\""], fields(c))
+    # The password from the environment stays out of inspect, as the URL's.
+    assert_false(c.inspect.include?("env-pw-9"), c.inspect)
+    assert_false([c].inspect.include?("env-pw-9"))
+  end
+
+  def test_the_url_wins
+    url = "postgres://ann:url-pw@urlhost:5433/urldb?application_name=urlapp&connect_timeout=3" +
+          "&sslmode=disable&sslrootcert=/url/ca.pem&options=-c%20x%3Dy"
+    assert_equal(["urlhost", "5433", "ann", "\"url-pw\"", "\"urldb\"", "\"urlapp\"", 3.seconds.inspect,
+                  ":disable", "\"/url/ca.pem\"", "\"-c x=y\""], fields(PG.parse_url(url, env: FULL)))
+    # The query's spellings too.
+    c = PG.parse_url("postgres://?host=qh&port=5434&user=qu&password=qp&dbname=qd", env: FULL)
+    assert_equal(["qh", "5434", "qu", "\"qp\"", "\"qd\""], fields(c).first(5))
+    # An empty parameter is given: the variable does not apply.
+    c = PG.parse_url("postgres://h/d?options=&application_name=", env: FULL)
+    assert_equal(["\"\"", "\"\""], [c.options.inspect, c.application_name.inspect])
+    # A user without a password: PGPASSWORD is the password of whoever connects.
+    assert_equal("\"env-pw-9\"", PG.parse_url("postgres://ann@h/d", env: FULL).password.inspect)
+  end
+
+  def test_keywords_win_and_defaults_stay
+    # (Connecting fails at once: the keywords' config is what the error
+    # path never shows, so it is checked through parse_url's equivalent
+    # rule and the defaults below.)
+    none = PG.parse_url("postgres://", env: Hash[String, String].new)
+    assert_equal(["localhost", "5432", "postgres", "nil", "nil", "nil", "nil", ":prefer", "nil", "nil"], fields(none))
+    assert_equal("me", PG.parse_url("postgres://", env: {"USER" => "me"}).user)
+    assert_equal("pu", PG.parse_url("postgres://", env: {"USER" => "me", "PGUSER" => "pu"}).user)
+    # sslrootcert=system: verify-full by default, a weaker PGSSLMODE
+    # refused as the same pair in the URL is.
+    assert_equal(:verify_full, PG.parse_url("postgres://h/d", env: {"PGSSLROOTCERT" => "system"}).sslmode)
+    assert_raise_message(/sslmode require with sslrootcert=system/) {
+      PG.parse_url("postgres://h/d?sslrootcert=system", env: {"PGSSLMODE" => "require"})
+    }
+    assert_raise_message(/sslmode require with sslrootcert=system/) {
+      PG.parse_url("postgres://h/d?sslmode=require", env: {"PGSSLROOTCERT" => "system"})
+    }
+    # PGSSLMODE weakens TLS below the default, as in libpq.
+    assert_equal(:disable, PG.parse_url("postgres://h/d", env: {"PGSSLMODE" => "disable"}).sslmode)
+  end
+
+  # PG.connect's keywords (now nil by default): with no environment, each
+  # documented default as before pg#71; each given keyword over its
+  # variable; each one not given from its variable.
+  def test_connect_keywords
+    none = Hash[String, String].new
+    d = PG::Config.from_keywords(env: none)
+    assert_equal(["localhost", "5432", "postgres", "nil", "nil", "nil", "nil", ":prefer", "nil", "nil"], fields(d))
+    assert_equal("me", PG::Config.from_keywords(env: {"USER" => "me"}).user)
+    assert_equal(:verify_full, PG::Config.from_keywords(sslrootcert: "system", env: none).sslmode)
+    k = PG::Config.from_keywords(host: "kh", port: 5440, user: "ku", password: "kp", database: "kd", application_name: "ka",
+                                 connect_timeout: 2.seconds, sslmode: :disable, sslrootcert: "/k/ca.pem", options: "-c k=1",
+                                 env: FULL)
+    assert_equal(["kh", "5440", "ku", "\"kp\"", "\"kd\"", "\"ka\"", 2.seconds.inspect, ":disable", "\"/k/ca.pem\"", "\"-c k=1\""],
+                 fields(k))
+    assert_equal(fields(PG.parse_url("postgres://", env: FULL)), fields(PG::Config.from_keywords(env: FULL)))
+  end
+
+  def test_empty_variables_are_unset
+    empty = Hash[String, String].new
+    FULL.each_key { |k| empty = empty.put(k, "") }
+    assert_equal(fields(PG.parse_url("postgres://", env: {"USER" => "postgres"})), fields(PG.parse_url("postgres://", env: empty)))
+    assert_equal(:prefer, PG.parse_url("postgres://h/d", env: {"PGSSLMODE" => ""}).sslmode)
+  end
+
+  def test_malformed_variables_name_the_variable
+    [[{"PGPORT" => "x"}, "PGPORT: not a number from 1 to 65535"],
+     [{"PGPORT" => "70000"}, "PGPORT: not a number from 1 to 65535"],
+     [{"PGPORT" => "5432,5433"}, "PGPORT: several ports are not supported"],
+     [{"PGHOST" => "a,b"}, "PGHOST: several hosts are not supported"],
+     [{"PGSSLMODE" => "strict"}, "PGSSLMODE: not one of disable, allow, prefer, require, verify-ca, verify-full"],
+     [{"PGCONNECT_TIMEOUT" => "5s"}, "PGCONNECT_TIMEOUT: not a number of seconds"],
+     [{"PGPASSWORD" => "sec\u0000ret-pw"}, "PGPASSWORD: holds a NUL character"]].each do |pair|
+      e = assert_raise(ArgumentError) { PG.parse_url("postgres://", env: pair[0]) }
+      assert_equal(pair[1], e.message)
+    end
+    # A malformed variable the URL shuts out is not read.
+    assert_equal(5432, PG.parse_url("postgres://h:5432/d", env: {"PGPORT" => "x"}).port)
+  end
+
+  def test_socket_directory
+    c = PG.parse_url("postgres://", env: {"PGHOST" => "/var/run/postgresql"})
+    assert_equal("/var/run/postgresql", c.host)
+  end
+
+  # A Testing URL (`?sslmode=prefer`, pg#71): host, port, user, password,
+  # database and sslmode do not come from the environment; a query
+  # appended with `&` gives the later sslmode, which pg's TLS tests rely on.
+  def test_a_testing_url_shuts_the_environment_out
+    url = "postgres://quarz:pw@127.0.0.1:5439/postgres?sslmode=prefer"
+    c = PG.parse_url(url, env: FULL.delete("PGSSLROOTCERT"))
+    assert_equal(["127.0.0.1", "5439", "quarz", "\"pw\"", "\"postgres\"", ":prefer"], fields(c).first(5) + [c.sslmode.inspect])
+    assert_equal(:require, PG.parse_url("#{url}&sslmode=require", env: Hash[String, String].new).sslmode)
+    # Still read: PGAPPNAME, PGOPTIONS, PGCONNECT_TIMEOUT, PGSSLROOTCERT.
+    assert_equal(["envapp", "-c search_path=env", 7.seconds.inspect], [c.application_name || "", c.options || "", c.connect_timeout.inspect])
+    # A stray PGSSLROOTCERT: a path keeps `prefer`, the server then
+    # verified against it when the session goes over TLS; `system`
+    # refuses `prefer`, as the URL's pair does.
+    r = PG.parse_url(url, env: {"PGSSLROOTCERT" => "/env/ca.pem"})
+    assert_equal([":prefer", "\"/env/ca.pem\""], [r.sslmode.inspect, r.sslrootcert.inspect])
+    assert_raise_message(/sslmode prefer with sslrootcert=system/) { PG.parse_url(url, env: {"PGSSLROOTCERT" => "system"}) }
+  end
+
+  # The test server's own URL is read without the environment.
+  def test_testing_server_reads_no_environment
+    server = PG::Testing::Server.new("postgres://ann:pw@127.0.0.1:5439/shop", nil, "/usr/bin")
+    assert_equal(["pw", "5439"], [server.password, server.port.to_s])
+  end
+
+  # A real login with the password from `env:` only.
+  def test_password_from_the_environment_logs_in
+    PG::Testing.with_cluster do |url|
+      base = PG.parse_url(url, env: Hash[String, String].new)
+      pw = base.password
+      pw = pw.is_a?(String) ? pw : ""
+      bare = "postgres://#{base.user}@#{base.host}:#{base.port}/#{base.database || "postgres"}"
+      c = PG.connect(bare, env: {"PGPASSWORD" => pw})
+      begin
+        assert_equal("1", c.exec("SELECT 1").rows[0][0])
+      ensure
+        c.close
+      end
+      c = PG.connect(host: base.host, port: base.port, user: base.user, database: base.database, env: {"PGPASSWORD" => pw})
+      c.close
+      PG::Pool.open(bare, size: 1, env: {"PGPASSWORD" => pw}) { |pool| pool.with { |conn| conn.exec("SELECT 1") } }
+      assert_raise(PG::Error) { PG.connect(bare, env: Hash[String, String].new) }
+    end
+  rescue PG::Testing::Unavailable => e
+    omit(e.message)
+  end
+end

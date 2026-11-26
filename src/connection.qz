@@ -110,7 +110,9 @@ data Lease(
   notifications: Array[Notification],
   channels: Set[String],
   # Whether a LISTEN may be in force that [channels] does not show.
-  unsure: Bool
+  unsure: Bool,
+  # Where and how a CancelRequest for the session goes (pg#14).
+  route: CancelRoute = CancelRoute.new(nil, nil)
 )
   # The lease without its cancel key (`secret`) and its configuration's
   # password ([PG::Config#inspect]).
@@ -120,11 +122,23 @@ data Lease(
   def to_s -> String = inspect
 end
 
+# :nodoc:
+# Where a CancelRequest for a session goes (pg#14): the server's address
+# the session reached (nil: `config.host` again, or a UNIX socket's path),
+# and the TLS configuration the session went over (nil: plain), which the
+# cancel uses as it is.
+data CancelRoute = (peer: Socket::Address?, tls: TLS::Config?)
+
 # A session with the server: one task's at a time. Moving it to another
 # task goes through a [PG::Lease].
 class Connection
   # How many prepared statements [#query] keeps by default.
   STATEMENT_CACHE_SIZE = 100
+
+  # The most a CancelRequest may take (connect, TLS, send, the server's
+  # close), added to an interrupted call's time only when the server
+  # does not answer.
+  CANCEL_TIMEOUT = 5.seconds
 
   @config: Config
   @statements: StatementCache
@@ -144,6 +158,7 @@ class Connection
   # rollback undoes).
   var @channels: Set[String] = Set[String].new
   var @unsure: Bool = false
+  var @route: CancelRoute = CancelRoute.new(nil, nil)
 
   # The connection without its cancel key and its configuration's
   # password ([PG::Config#inspect]).
@@ -200,10 +215,20 @@ class Connection
       raise ConnectionError.new("cannot connect to #{Connection.where(config)}: #{e.message}")
     end
     begin
-      if tls && (sock = io.as?(TCPSocket))
-        io = secure(config, sock, early)
+      peer: Socket::Address? = nil
+      used: TLS::Config? = nil
+      if (sock = io.as?(TCPSocket))
+        peer = begin
+                 sock.remote_address
+               rescue IOError
+                 nil
+               end
+        if tls
+          io, used = secure(config, sock, early)
+        end
       end
       conn = Connection.new(config, io)
+      conn.cancel_route = CancelRoute.new(peer, used)
       conn.startup
       conn
     rescue Exception => e
@@ -216,8 +241,9 @@ class Connection
   end
 
   # Asks the server for TLS (an SSLRequest) and runs the handshake when it
-  # agrees; when it refuses, `sock` itself unless TLS is required.
-  private def self.secure(config: Config, sock: TCPSocket, tls: TLS::Config?) -> IO
+  # agrees; when it refuses, `sock` itself unless TLS is required. With
+  # the TLS configuration used (nil: plain).
+  private def self.secure(config: Config, sock: TCPSocket, tls: TLS::Config?) -> [IO, TLS::Config?]
     answer = begin
       sock.write(Frontend.ssl_request)
       sock.read_bytes(1)
@@ -228,7 +254,7 @@ class Connection
     when b"S"
       t = tls || tls_config(config)
       begin
-        TLSSocket.connect(sock, config.host, t)
+        [TLSSocket.connect(sock, config.host, t), t]
       rescue IOError, SystemCallError, ArgumentError => e
         # (`TLS::Error` is an `IOError`; `ArgumentError`: a host that is
         # not a server name to TLS, an IPv6 address with a zone, say.)
@@ -236,7 +262,7 @@ class Connection
       end
     when b"N"
       if config.sslmode == :prefer || config.sslmode == :allow
-        sock
+        [sock, nil]
       else
         raise ConnectionError.new("#{Connection.where(config)}: the server does not support SSL (sslmode #{config.sslmode})")
       end
@@ -321,6 +347,7 @@ class Connection
     @notifications = lease.notifications
     @channels = lease.channels
     @unsure = lease.unsure
+    @route = lease.route
   end
 
   # Makes a connection of `lease` in the calling task: the session goes on
@@ -348,7 +375,7 @@ class Connection
     end
     @closed = true
     Lease.new(@io, @config, @process_id, @secret, @parameters, @statements.snapshot,
-              @notifications, @channels, @unsure)
+              @notifications, @channels, @unsure, @route)
   end
 
   # The run-time parameters the server reported (server_version,
@@ -362,6 +389,13 @@ class Connection
 
   # The server process serving this session.
   def process_id -> Int = @process_id
+
+  # :nodoc:
+  # Where a CancelRequest for the session goes (set when it connects).
+  def cancel_route=(route: CancelRoute) -> Void
+    @route = route
+    nil
+  end
 
   # `:idle`, `:in_transaction` or `:failed` (a transaction an error
   # aborted), as of the last time the server was ready.
@@ -532,7 +566,15 @@ class Connection
   # A call that does not read the server's whole answer (its task was
   # cancelled or timed out, or a notice handler raised) closes the
   # connection: what is left of the answer would be taken for the next
-  # one's.
+  # one's. When it was cut by a cancellation or a [Task.timeout] after
+  # the statement was sent, a CancelRequest first asks the server to stop
+  # the statement (pg#14), on a connection of its own to the same server
+  # (over TLS with the session's own configuration when the session went
+  # over TLS, never in clear then): the server does not go on running it.
+  # The cancel takes at most `CANCEL_TIMEOUT` (5 seconds), added to the
+  # interrupted call's time only when the server does not answer it; a
+  # cancel that cannot be sent is dropped, and the call raises its own
+  # Cancelled or Timeout as before.
   def exec(sql: String) -> Result = exec_all(sql).last? || Result.new([], [], "")
 
   # As [#exec], but returns every statement's result, in order.
@@ -837,13 +879,18 @@ class Connection
   # block every message but errors (the first is raised at the end, after
   # the connection is in step again) and ReadyForQuery. Anything that
   # leaves before the end (a cancelled task, an exception) closes the
-  # connection.
+  # connection; a cancellation or a timeout after the request was sent
+  # sends a CancelRequest first (`cancel_quietly`). The connection is
+  # closed even then: it runs nothing afterwards, so a cancel that comes
+  # late cannot stop a next statement.
   private def converse(request: Bytes, &handle: (Backend) -> Void) -> Void
     error: ServerError? = nil
     done = false
+    sent = false
     begin
       # Inside: a write cut short leaves part of a request on the wire.
       send(request)
+      sent = true
       loop do
         m = begin
           receive
@@ -862,6 +909,11 @@ class Connection
           handle.call(m)
         end
       end
+    rescue Task::Cancelled, Task::Timeout => interrupted
+      # Cut short while the server runs the statement: ask it to stop
+      # (pg#14) before the session's socket is closed below.
+      cancel_quietly if sent && !done
+      raise interrupted
     ensure
       unless done
         @closed = true
@@ -1111,6 +1163,61 @@ class Connection
     else
       m
     end
+  end
+
+  # Sends a CancelRequest for the statement the session runs (pg#14), on
+  # a connection of its own to the server the session reached, over TLS
+  # with the session's own configuration when the session went over TLS
+  # (never in clear then), within [CANCEL_TIMEOUT], even in a task being
+  # cancelled. Never raises: a cancel that cannot be sent leaves the
+  # statement to the server, as closing the session does.
+  private def cancel_quietly -> Void
+    return if @process_id == 0 || @secret.empty?
+    config = @config
+    route = @route
+    request = Frontend.cancel_request(@process_id, @secret)
+    Task.uncancellable do
+      begin
+        Task.timeout(CANCEL_TIMEOUT) { Connection.send_cancel(config, route, request) }
+      rescue Exception
+        nil
+      end
+    end
+    nil
+  end
+
+  # :nodoc:
+  # Sends `request` (a CancelRequest) as `cancel_quietly` says, and waits
+  # for the server to close the connection, so that the cancel is taken
+  # before the session's socket closes. Raises what the socket raises.
+  def self.send_cancel(config: Config, route: CancelRoute, request: Bytes) -> Void
+    io: IO = if config.host.start_with?("/")
+               UNIXSocket.new("#{config.host}/.s.PGSQL.#{config.port}")
+             elsif (peer = route.peer)
+               TCPSocket.connect(peer)
+             else
+               Socket.tcp(config.host, config.port)
+             end
+    begin
+      if (t = route.tls) && (sock = io.as?(TCPSocket))
+        sock.write(Frontend.ssl_request)
+        # (A server that will not speak TLS gets nothing: the key never
+        # goes in clear for a session that went over TLS.)
+        return nil unless sock.read_bytes(1) == b"S"
+        io = TLSSocket.connect(sock, config.host, t)
+      end
+      io.write(request)
+      io.flush
+      loop do
+        break if io.read_bytes(1).empty?
+      end
+    ensure
+      begin
+        io.close
+      rescue IOError, SystemCallError
+      end
+    end
+    nil
   end
 
   private def broken(message: String) -> Nothing

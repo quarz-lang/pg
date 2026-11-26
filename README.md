@@ -208,7 +208,8 @@ used any further; [PG::TransactionError] and [PG::NullError] are misuses.
   [PG::Connection] of one in the calling task, runs an ordinary block,
   and gives it back (rolled back first if the block left a transaction
   open; closed instead if it broke or a call was cut short, and replaced
-  when needed). `pool.exec`, `pool.query`, `pool.transaction` are
+  when needed; a statement cut short by a cancellation or a timeout is
+  cancelled on the server first, see below). `pool.exec`, `pool.query`, `pool.transaction` are
   shortcuts. `checkout_timeout` bounds the wait for a free connection
   ([PG::PoolTimeout]). A connection idle for longer than `idle_timeout`
   (5 minutes; nil keeps them) is closed when the pool is next used, the
@@ -310,8 +311,18 @@ end
   tests when there is none). Given `certificate:` and `private_key:`
   (PEM), the cluster is always a throwaway one, with TLS on.
 
-Not yet: COPY, cancel requests, client
-certificates, channel binding.
+- A query cut short by a task's cancellation or a [Task.timeout] sends a
+  CancelRequest so the server stops the statement, then closes the
+  connection (pg#14). The cancel goes on a connection of its own to the
+  same server (the address the session reached, or its UNIX socket),
+  over TLS with the session's own TLS configuration when the session
+  went over TLS (never in clear then; PostgreSQL 17's libpq does the
+  same), within 5 seconds, which add to the interrupted call only when
+  the server does not answer. A cancel that cannot be sent is dropped:
+  the call raises its own Cancelled or Timeout. No cancel is sent while
+  waiting for a notification, or for a statement that has finished.
+
+Not yet: COPY, client certificates, channel binding.
 
 ## Differences from libpq
 

@@ -222,9 +222,7 @@ def read_url(url: String) -> [Config, Array[String]]
     when "password" then password = value
     when "dbname" then database = value
     when "application_name" then application_name = value
-    when "connect_timeout"
-      raise ArgumentError.new("connect_timeout: not a number of seconds") unless value.match?(/\A[0-9]{1,9}\z/)
-      connect_timeout = value.to_i == 0 ? nil : value.to_i.seconds
+    when "connect_timeout" then connect_timeout = Config.connect_timeout(value)
     when "min_scram_iterations"
       raise ArgumentError.new("min_scram_iterations: not a positive number") unless value.match?(/\A[1-9][0-9]{0,9}\z/)
       min_scram_iterations = value.to_i
@@ -329,8 +327,7 @@ extension Config
       c = c.with(application_name: a)
     end
     if (t = ungiven.call("connect_timeout"))
-      raise ArgumentError.new("PGCONNECT_TIMEOUT: not a number of seconds") unless t.match?(/\A[0-9]{1,9}\z/)
-      c = c.with(connect_timeout: t.to_i == 0 ? nil : t.to_i.seconds)
+      c = c.with(connect_timeout: Config.connect_timeout(t, what: "PGCONNECT_TIMEOUT"))
     end
     if (r = ungiven.call("sslrootcert"))
       c = c.with(sslrootcert: r)
@@ -448,6 +445,13 @@ extension Config
   # `:prefer`, `:require`, `:verify_ca` or `:verify_full`.
   def self.sslmode?(mode: Symbol) -> Bool
     [:disable, :allow, :prefer, :require, :verify_ca, :verify_full].include?(mode)
+  end
+
+  # A connect timeout in whole seconds, 0 meaning none (nil), as libpq's
+  # (`what` names it in the error).
+  def self.connect_timeout(text: String, *, what: String = "connect_timeout") -> Duration?
+    raise ArgumentError.new("#{what}: not a number of seconds") unless text.match?(/\A[0-9]{1,9}\z/)
+    text.to_i == 0 ? nil : text.to_i.seconds
   end
 
   # A port number, 1 to 65535 (`what` names it in the error).

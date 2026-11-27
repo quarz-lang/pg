@@ -59,6 +59,56 @@ data StandInPG(server: TCPServer, cancels: Atom[Array[Bytes]], close_cancels: Bo
   end
 end
 
+# A stand-in over TLS for a connection built by hand: the first
+# connection is the session (an SSLRequest answered `S`, the handshake
+# with the test certificate, then a session as StandInPG's that never
+# answers a query); every later one, a cancel, is counted.
+data TLSStandIn(server: TCPServer, later: Atom[Int])
+  def self.start -> TLSStandIn = TLSStandIn.new(TCPServer.new("127.0.0.1", 0), Atom.new(0))
+
+  def port -> Int = server.local_address.port
+
+  def serve(scope: Task::Scope) -> Void
+    me = self
+    scope.spawn do
+      tls = TLS::ServerConfig.new(certificate: File.read("test/fixtures/tls/server.pem"),
+                                  private_key: File.read("test/fixtures/tls/server.key"))
+      first = true
+      loop do
+        sock = me.server.accept
+        if first
+          first = false
+          scope.spawn { me.session(sock, tls) }
+        else
+          me.later.update { |n| n + 1 }
+          sock.close
+        end
+      end
+      nil
+    end
+    nil
+  end
+
+  def session(sock: TCPSocket, tls: TLS::ServerConfig) -> Void
+    return nil if sock.read_bytes(8).size < 8
+    sock.write(b"S")
+    io = tls.accept(sock)
+    head = io.read_bytes(4)
+    size = (head[0] << 24) | (head[1] << 16) | (head[2] << 8) | head[3]
+    io.read_bytes(size - 4)
+    io.write(b"R\x00\x00\x00\x08\x00\x00\x00\x00")
+    io.write(b"K\x00\x00\x00\x0c\x00\x00\x10\x92" + StandInPG::SECRET)
+    io.write(b"Z\x00\x00\x00\x05I")
+    io.flush
+    loop do
+      break if io.read_bytes(1).empty?
+    end
+    nil
+  rescue IOError, SystemCallError
+    nil
+  end
+end
+
 # CancelRequests (pg#14): a query cut short by a cancellation or a
 # Task.timeout asks the server to stop the statement.
 class CancelTest < Test::Case
@@ -216,6 +266,31 @@ class CancelTest < Test::Case
       # (The stand-in reads the 8-byte SSLRequest as a request and closes.)
       PG::Connection.send_cancel(config, route, PG::Frontend.cancel_request(4242, StandInPG::SECRET))
       assert_equal([PG::Frontend.ssl_request], fake.cancels.get)
+      fake.server.close
+      s.cancel
+    end
+  end
+
+  # A connection built by hand over TLS has no cancel route: cut short, it
+  # sends no cancel (never one in clear for a session over TLS); the
+  # stand-in gets no second connection.
+  def test_a_hand_built_tls_connection_sends_no_cancel
+    fake = TLSStandIn.start
+    Task.scope do |s|
+      fake.serve(s)
+      config = PG.parse_url("postgres://u@localhost:#{fake.port}/d?require_auth=none", env: Hash[String, String].new)
+      sock = TCPSocket.new("127.0.0.1", fake.port)
+      sock.write(PG::Frontend.ssl_request)
+      assert_equal(b"S", sock.read_bytes(1))
+      io = TLSSocket.connect(sock, "localhost", TLS::Config.new(roots: TLS::Roots.from_pem(File.read("test/fixtures/tls/ca.pem"))))
+      c = PG::Connection.new(config, io)
+      c.startup
+      assert_true(c.tls?)
+      assert_raise(Task::Timeout) { Task.timeout(200.ms) { c.exec("SELECT 1") } }
+      assert_true(c.closed?)
+      # (A cancel would have been sent before the Timeout was raised, and
+      # waits for the stand-in to close, which counts it first.)
+      assert_equal(0, fake.later.get)
       fake.server.close
       s.cancel
     end

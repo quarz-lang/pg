@@ -227,8 +227,7 @@ class Connection
           io, used = secure(config, sock, early)
         end
       end
-      conn = Connection.new(config, io)
-      conn.cancel_route = CancelRoute.new(peer, used)
+      conn = Connection.new(config, io, CancelRoute.new(peer, used))
       conn.startup
       conn
     rescue Exception => e
@@ -329,8 +328,23 @@ class Connection
     "md5" + Digest::MD5.hexdigest(inner.to_bytes + salt)
   end
 
-  # A connection over `io`, not started: [PG.connect] makes them.
+  # A connection over `io`, not started: [PG.connect] makes them. One
+  # made here by hand has no cancel route (pg#14): a statement it cuts
+  # short by a cancellation or a timeout is cancelled in plain to
+  # `config.host` and port over a plain `io`, and not at all over a
+  # [TLSSocket] (never in clear for a session over TLS: the statement is
+  # left to the server, which stops it when it next writes).
   def initialize(@config: Config, @io: IO)
+    @reader = MessageReader.new(io)
+    @statements = StatementCache.new(@config.statement_cache_size)
+  end
+
+  # :nodoc:
+  # A connection over `io` with the route its cancels take, as
+  # `Connection.start` makes it. (Public as every constructor is,
+  # docs/01: a route given here never makes a session over TLS cancel in
+  # clear, `cancel_quietly`'s first check.)
+  def initialize(@config: Config, @io: IO, @route: CancelRoute)
     @reader = MessageReader.new(io)
     @statements = StatementCache.new(@config.statement_cache_size)
   end
@@ -390,12 +404,7 @@ class Connection
   # The server process serving this session.
   def process_id -> Int = @process_id
 
-  # :nodoc:
-  # Where a CancelRequest for the session goes (set when it connects).
-  def cancel_route=(route: CancelRoute) -> Void
-    @route = route
-    nil
-  end
+
 
   # `:idle`, `:in_transaction` or `:failed` (a transaction an error
   # aborted), as of the last time the server was ready.
@@ -1172,7 +1181,11 @@ class Connection
   # cancelled. Never raises: a cancel that cannot be sent leaves the
   # statement to the server, as closing the session does.
   private def cancel_quietly -> Void
-    return if @process_id == 0 || @secret.empty?
+    # (A session over TLS whose route has no TLS configuration, one built
+    # by hand or adopted from a lease made without it, would cancel in
+    # clear: it sends nothing.)
+    return nil if tls? && @route.tls.nil?
+    return nil if @process_id == 0 || @secret.empty?
     config = @config
     route = @route
     request = Frontend.cancel_request(@process_id, @secret)
